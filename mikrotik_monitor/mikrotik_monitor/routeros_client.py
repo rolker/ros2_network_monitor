@@ -100,3 +100,7 @@ class RouterOSClient:
     def get_system_resource(self) -> dict:
         """Get system resource usage (CPU, memory, uptime)."""
         return self.get('/system/resource')
+
+    def get_system_health(self):
+        """Get system health (temperature, voltage) if available."""
+        return self.get('/system/health')

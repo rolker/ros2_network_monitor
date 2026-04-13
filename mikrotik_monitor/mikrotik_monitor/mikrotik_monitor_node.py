@@ -77,6 +77,7 @@ class MikroTikMonitorNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
 
         try:
+            self._add_system_diagnostics(msg)
             self._add_interface_diagnostics(msg)
             self._add_wireless_diagnostics(msg)
         except RouterOSClientError as e:
@@ -90,6 +91,48 @@ class MikroTikMonitorNode(Node):
             self.get_logger().warn(f'Failed to poll device: {e}')
 
         self.diag_pub.publish(msg)
+
+    def _add_system_diagnostics(self, msg: DiagnosticArray):
+        resource = self.client.get_system_resource()
+        status = DiagnosticStatus()
+        status.name = f'MikroTik: {self.hardware_id}: system'
+        status.hardware_id = self.hardware_id
+        status.level = DiagnosticStatus.OK
+        status.message = resource.get('board-name', 'unknown')
+
+        fields = [
+            'board-name', 'version', 'uptime',
+            'cpu-load', 'cpu-count', 'cpu-frequency',
+            'free-memory', 'total-memory',
+            'free-hdd-space', 'total-hdd-space',
+        ]
+        for field in fields:
+            if field in resource:
+                status.values.append(
+                    KeyValue(key=field, value=str(resource[field]))
+                )
+
+        # Add health data (temperature, voltage) if available
+        try:
+            health = self.client.get_system_health()
+            if isinstance(health, list):
+                for entry in health:
+                    name = entry.get('name', '')
+                    value = entry.get('value', '')
+                    if name and value:
+                        status.values.append(
+                            KeyValue(key=name, value=str(value))
+                        )
+            elif isinstance(health, dict):
+                for key, value in health.items():
+                    if key != '.id':
+                        status.values.append(
+                            KeyValue(key=key, value=str(value))
+                        )
+        except RouterOSClientError:
+            pass  # Not all devices support /system/health
+
+        msg.status.append(status)
 
     def _add_interface_diagnostics(self, msg: DiagnosticArray):
         interfaces = self.client.get_interfaces()
