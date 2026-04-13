@@ -1,0 +1,10 @@
+# Ping monitor configuration
+# targets: list of "name:address" strings
+ping_monitor:
+  ros__parameters:
+    targets:
+      - "google_dns:8.8.8.8"
+      - "cloudflare_dns:1.1.1.1"
+    poll_interval: 10.0
+    ping_count: 3
+    ping_timeout: 5.0
