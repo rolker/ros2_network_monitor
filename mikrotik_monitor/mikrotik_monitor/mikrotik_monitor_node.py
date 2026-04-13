@@ -101,8 +101,8 @@ class MikroTikMonitorNode(Node):
             )
             status.hardware_id = self.hardware_id
 
-            running = iface.get('running', False)
-            disabled = iface.get('disabled', False)
+            running = str(iface.get('running', 'false')).lower() == 'true'
+            disabled = str(iface.get('disabled', 'false')).lower() == 'true'
 
             if disabled:
                 status.level = DiagnosticStatus.WARN
