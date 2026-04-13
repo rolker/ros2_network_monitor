@@ -3,7 +3,8 @@ mikrotik_monitor:
     host: ''
     username: 'admin'
     password: ''
-    port: 443
+    port: 80
+    use_ssl: false
     poll_interval: 5.0
     hardware_id: ''
     verify_ssl: false

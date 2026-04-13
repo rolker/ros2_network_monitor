@@ -16,7 +16,8 @@ class MikroTikMonitorNode(Node):
         self.declare_parameter('host', '')
         self.declare_parameter('username', 'admin')
         self.declare_parameter('password', '')
-        self.declare_parameter('port', 443)
+        self.declare_parameter('port', 80)
+        self.declare_parameter('use_ssl', False)
         self.declare_parameter('poll_interval', 5.0)
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
@@ -35,6 +36,9 @@ class MikroTikMonitorNode(Node):
         port = self.get_parameter(
             'port'
         ).get_parameter_value().integer_value
+        use_ssl = self.get_parameter(
+            'use_ssl'
+        ).get_parameter_value().bool_value
         poll_interval = self.get_parameter(
             'poll_interval'
         ).get_parameter_value().double_value
@@ -50,6 +54,7 @@ class MikroTikMonitorNode(Node):
             username=username,
             password=password,
             port=port,
+            use_ssl=use_ssl,
             verify_ssl=verify_ssl,
         )
 

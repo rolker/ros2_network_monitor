@@ -15,8 +15,9 @@ class RouterOSClientError(Exception):
 class RouterOSClient:
     """Client for the RouterOS 7 REST API.
 
-    Uses HTTP basic auth over HTTPS. By default, SSL certificate
-    verification is disabled since MikroTik devices use self-signed certs.
+    Uses HTTP basic auth. Supports both HTTP and HTTPS (use_ssl parameter).
+    SSL certificate verification is disabled by default since MikroTik
+    devices typically use self-signed certs.
     """
 
     def __init__(
@@ -24,11 +25,13 @@ class RouterOSClient:
         host: str,
         username: str,
         password: str,
-        port: int = 443,
+        port: int = 80,
+        use_ssl: bool = False,
         verify_ssl: bool = False,
         timeout: float = 10.0,
     ):
-        self.base_url = f'https://{host}:{port}/rest'
+        scheme = 'https' if use_ssl else 'http'
+        self.base_url = f'{scheme}://{host}:{port}/rest'
         self.timeout = timeout
 
         # Build auth header
@@ -40,11 +43,13 @@ class RouterOSClient:
             'Content-Type': 'application/json',
         }
 
-        # SSL context for self-signed certs
-        self.ssl_context = ssl.create_default_context()
-        if not verify_ssl:
-            self.ssl_context.check_hostname = False
-            self.ssl_context.verify_mode = ssl.CERT_NONE
+        # SSL context for self-signed certs (only used when use_ssl=True)
+        self.ssl_context = None
+        if use_ssl:
+            self.ssl_context = ssl.create_default_context()
+            if not verify_ssl:
+                self.ssl_context.check_hostname = False
+                self.ssl_context.verify_mode = ssl.CERT_NONE
 
     def get(self, path: str) -> Any:
         """GET a REST API endpoint. Returns parsed JSON response.
