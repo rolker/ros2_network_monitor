@@ -88,7 +88,7 @@ class MikroTikMonitorNode(Node):
             status.hardware_id = self.hardware_id
             status.message = f'Connection error: {e}'
             msg.status.append(status)
-            self.get_logger().warn(f'Failed to poll device: {e}')
+            self.get_logger().warning(f'Failed to poll device: {e}')
 
         self.diag_pub.publish(msg)
 
@@ -177,8 +177,13 @@ class MikroTikMonitorNode(Node):
     def _add_wireless_diagnostics(self, msg: DiagnosticArray):
         try:
             registrations = self.client.get_wireless_registrations()
-        except RouterOSClientError:
-            # Device may not have wireless interfaces — not an error
+        except RouterOSClientError as e:
+            if e.http_code in (400, 404):
+                # Device doesn't have wireless interfaces — not an error
+                return
+            self.get_logger().warning(
+                f'Failed to query wireless registrations: {e}'
+            )
             return
 
         for reg in registrations:

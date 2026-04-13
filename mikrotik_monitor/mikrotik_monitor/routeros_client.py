@@ -11,6 +11,10 @@ from typing import Any
 class RouterOSClientError(Exception):
     """Error communicating with RouterOS device."""
 
+    def __init__(self, message: str, http_code: int | None = None):
+        super().__init__(message)
+        self.http_code = http_code
+
 
 class RouterOSClient:
     """Client for the RouterOS 7 REST API.
@@ -74,7 +78,8 @@ class RouterOSClient:
         except urllib.error.HTTPError as e:
             body = e.read().decode() if e.fp else ''
             raise RouterOSClientError(
-                f'HTTP {e.code} from {url}: {body}'
+                f'HTTP {e.code} from {url}: {body}',
+                http_code=e.code,
             ) from e
         except urllib.error.URLError as e:
             raise RouterOSClientError(
