@@ -48,6 +48,22 @@ ros2 run mikrotik_monitor mikrotik_monitor_node --ros-args \
     -p password:=<password>
 ```
 
+## Deployment
+
+Run one node per MikroTik device, monitoring only the **local** device on
+each machine. This avoids duplicate diagnostics when messages are bridged
+(e.g., via `udp_bridge`) and ensures each node can always reach its device
+regardless of WiFi link state.
+
+For example, with a WiFi bridge between an operator station and a boat:
+
+- **Operator station** runs one node monitoring the operator-side MikroTik
+- **Boat** runs one node monitoring the boat-side MikroTik
+
+If the WiFi link drops, each side still reports its local device status.
+The wireless registration table going empty is itself an indicator that
+the link is down.
+
 ## MikroTik Device Setup
 
 Create a read-only monitoring account on each MikroTik device. This limits
