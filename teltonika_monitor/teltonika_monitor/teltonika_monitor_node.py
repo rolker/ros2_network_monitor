@@ -108,18 +108,23 @@ class TeltonikaMonitorNode(Node):
         release = board.get('release', {})
         for field in ['distribution', 'version', 'description']:
             if field in release:
-                status.values.append(
-                    KeyValue(key=f'release.{field}',
-                             value=str(release[field]))
-                )
+                status.values.append(KeyValue(
+                    key=f'release.{field}',
+                    value=str(release[field]),
+                ))
 
         msg.status.append(status)
 
     def _add_cellular_diagnostics(self, msg: DiagnosticArray):
         try:
             signal = self.client.get_signal()
-        except UbusClientError:
-            # No cellular service or no SIM — not an error
+        except UbusClientError as e:
+            if e.code == 3:
+                # Method not found — no cellular modem
+                return
+            self.get_logger().warning(
+                f'Failed to query cellular signal: {e}'
+            )
             return
 
         status = DiagnosticStatus()
@@ -145,7 +150,13 @@ class TeltonikaMonitorNode(Node):
     def _add_mwan3_diagnostics(self, msg: DiagnosticArray):
         try:
             mwan = self.client.get_mwan3_status()
-        except UbusClientError:
+        except UbusClientError as e:
+            if e.code == 3:
+                # Method not found — mwan3 not installed
+                return
+            self.get_logger().warning(
+                f'Failed to query mwan3 status: {e}'
+            )
             return
 
         interfaces = mwan.get('interfaces', {})
@@ -192,7 +203,12 @@ class TeltonikaMonitorNode(Node):
     def _add_interface_diagnostics(self, msg: DiagnosticArray):
         try:
             result = self.client.get_network_interfaces()
-        except UbusClientError:
+        except UbusClientError as e:
+            if e.code == 3:
+                return
+            self.get_logger().warning(
+                f'Failed to query network interfaces: {e}'
+            )
             return
 
         for iface in result.get('interface', []):

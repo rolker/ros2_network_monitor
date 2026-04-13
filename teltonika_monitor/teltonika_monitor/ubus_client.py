@@ -175,8 +175,11 @@ class UbusClient:
                     ],
                 })
                 if 'error' in result:
+                    retry_error = result['error']
                     raise UbusClientError(
-                        f'ubus {obj}.{method}: {msg}', code=code
+                        f'ubus {obj}.{method}: '
+                        f'{retry_error.get("message", "unknown")}',
+                        code=retry_error.get('code'),
                     )
             else:
                 raise UbusClientError(
