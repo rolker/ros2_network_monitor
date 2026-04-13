@@ -6,6 +6,7 @@
 
 """ROS 2 node that pings a list of targets and publishes diagnostics."""
 
+import math
 import subprocess
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
@@ -40,7 +41,14 @@ class PingMonitorNode(Node):
                 )
                 raise SystemExit(1)
             name, address = entry.split(':', 1)
-            self.targets.append((name.strip(), address.strip()))
+            name, address = name.strip(), address.strip()
+            if not name or not address:
+                self.get_logger().error(
+                    f'Invalid target "{entry}": '
+                    'name and address must be non-empty.'
+                )
+                raise SystemExit(1)
+            self.targets.append((name, address))
 
         self.poll_interval = self.get_parameter(
             'poll_interval'
@@ -72,13 +80,14 @@ class PingMonitorNode(Node):
 
         Uses the system ping command to avoid requiring raw socket privileges.
         """
-        deadline = int(self.ping_timeout * self.ping_count) + 1
+        timeout_s = max(1, math.ceil(self.ping_timeout))
+        deadline = timeout_s * self.ping_count + 1
         try:
             result = subprocess.run(
                 [
                     'ping',
                     '-c', str(self.ping_count),
-                    '-W', str(int(self.ping_timeout)),
+                    '-W', str(timeout_s),
                     '-w', str(deadline),
                     address,
                 ],
@@ -87,6 +96,8 @@ class PingMonitorNode(Node):
                 timeout=deadline + 5,
             )
         except subprocess.TimeoutExpired:
+            return False, 0.0, 100.0
+        except FileNotFoundError:
             return False, 0.0, 100.0
 
         loss = 100.0
