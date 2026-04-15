@@ -115,6 +115,62 @@ class TeltonikaMonitorNode(Node):
 
         msg.status.append(status)
 
+    @staticmethod
+    def _parse_dbm(value):
+        """Parse a dBm string like '-85 dBm' to a float, or return None."""
+        if value is None:
+            return None
+        try:
+            return float(str(value).split()[0])
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _parse_db(value):
+        """Parse a dB string like '12.5 dB' to a float, or return None."""
+        if value is None:
+            return None
+        try:
+            return float(str(value).split()[0])
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _cellular_quality(rsrp, sinr):
+        """Map RSRP/SINR to a diagnostic level and signal bars string.
+
+        Thresholds based on 3GPP signal quality ranges for LTE:
+          Excellent: RSRP > -80   SINR > 20
+          Good:      RSRP > -90   SINR > 13
+          Fair:      RSRP > -100  SINR > 0
+          Poor:      RSRP > -110  SINR > -5
+          Very poor: below
+        """
+        bar_chars = ['▁', '▂', '▃', '▅', '█']
+        if rsrp is None:
+            return DiagnosticStatus.WARN, '?'
+        if rsrp > -80:
+            n = 5
+        elif rsrp > -90:
+            n = 4
+        elif rsrp > -100:
+            n = 3
+        elif rsrp > -110:
+            n = 2
+        else:
+            n = 1
+        # SINR can downgrade by one bar
+        if sinr is not None and sinr < 0 and n > 1:
+            n -= 1
+        bars = ''.join(bar_chars[:n]) + ''.join('·' for _ in range(5 - n))
+        if n >= 4:
+            level = DiagnosticStatus.OK
+        elif n >= 2:
+            level = DiagnosticStatus.WARN
+        else:
+            level = DiagnosticStatus.ERROR
+        return level, bars
+
     def _add_cellular_diagnostics(self, msg: DiagnosticArray):
         try:
             signal = self.client.get_signal()
@@ -136,8 +192,12 @@ class TeltonikaMonitorNode(Node):
             status.level = DiagnosticStatus.WARN
             status.message = 'No service'
         else:
-            status.level = DiagnosticStatus.OK
-            status.message = net_mode
+            rsrp = self._parse_dbm(signal.get('rsrp'))
+            sinr = self._parse_db(signal.get('sinr'))
+            level, bars = self._cellular_quality(rsrp, sinr)
+            status.level = level
+            rsrp_str = f' {rsrp:.0f}dBm' if rsrp is not None else ''
+            status.message = f'{net_mode}{rsrp_str} {bars}'
 
         for field in ['net_mode', 'rssi', 'rsrp', 'sinr', 'rsrq']:
             if field in signal:

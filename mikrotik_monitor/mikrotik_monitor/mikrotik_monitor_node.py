@@ -195,8 +195,12 @@ class MikroTikMonitorNode(Node):
                 f'wireless/{interface}/{mac}'
             )
             status.hardware_id = self.hardware_id
-            status.level = DiagnosticStatus.OK
-            status.message = 'Associated'
+
+            snr = self._parse_snr(reg.get('signal-to-noise'))
+            level, bars = self._wireless_quality(snr)
+            status.level = level
+            snr_str = f' SNR {snr:.0f}dB' if snr is not None else ''
+            status.message = f'Associated{snr_str} {bars}'
 
             fields = [
                 'interface', 'mac-address',
@@ -215,6 +219,49 @@ class MikroTikMonitorNode(Node):
                     )
 
             msg.status.append(status)
+
+    @staticmethod
+    def _parse_snr(value):
+        """Parse an SNR string like '22@HT40' or '22 dB' to float."""
+        if value is None:
+            return None
+        try:
+            return float(str(value).split('@')[0].split()[0])
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _wireless_quality(snr):
+        """Map SNR to a diagnostic level and signal bars string.
+
+        Thresholds for 5 GHz point-to-point link:
+          Excellent: SNR > 30
+          Good:      SNR > 20
+          Fair:      SNR > 15
+          Poor:      SNR > 10
+          Very poor: below
+        """
+        bar_chars = ['▁', '▂', '▃', '▅', '█']
+        if snr is None:
+            return DiagnosticStatus.WARN, '?'
+        if snr > 30:
+            n = 5
+        elif snr > 20:
+            n = 4
+        elif snr > 15:
+            n = 3
+        elif snr > 10:
+            n = 2
+        else:
+            n = 1
+        bars = ''.join(bar_chars[:n]) + ''.join('·' for _ in range(5 - n))
+        if n >= 4:
+            level = DiagnosticStatus.OK
+        elif n >= 2:
+            level = DiagnosticStatus.WARN
+        else:
+            level = DiagnosticStatus.ERROR
+        return level, bars
 
 
 def main(args=None):
