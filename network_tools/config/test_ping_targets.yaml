@@ -1,5 +1,6 @@
 # Test configuration for local development.
-# Exercises OK, WARN (real latency), and ERROR (unreachable) paths.
+# Exercises OK and ERROR (unreachable) paths. Public DNS targets add
+# real-network latency but do not reliably trigger WARN (requires packet loss).
 # Launch: ros2 launch network_tools ping_monitor.launch.py \
 #           config_file:=<path>/test_ping_targets.yaml
 ping_monitor:
