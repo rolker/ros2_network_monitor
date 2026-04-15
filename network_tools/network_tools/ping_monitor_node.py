@@ -60,9 +60,9 @@ class PingMonitorNode(Node):
         self.ping_timeout = self.get_parameter(
             'ping_timeout'
         ).value
-        self.hw_id = self.get_parameter('hardware_id').value
+        self.hardware_id = self.get_parameter('hardware_id').value
         self._name_prefix = (
-            f'Ping: {self.hw_id}' if self.hw_id else 'Ping'
+            f'Ping: {self.hardware_id}' if self.hardware_id else 'Ping'
         )
 
         self.diag_pub = self.create_publisher(
@@ -138,7 +138,7 @@ class PingMonitorNode(Node):
 
             status = DiagnosticStatus()
             status.name = f'{self._name_prefix}: {name}'
-            status.hardware_id = self.hw_id or address
+            status.hardware_id = self.hardware_id or address
 
             if not success:
                 status.level = DiagnosticStatus.ERROR
