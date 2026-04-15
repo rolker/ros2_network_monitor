@@ -1,0 +1,16 @@
+# Test configuration for local development.
+# Exercises OK and ERROR (unreachable) paths. Public DNS targets add
+# real-network latency but do not reliably trigger WARN (requires packet loss).
+# Launch: ros2 launch network_tools ping_monitor.launch.py \
+#           config_file:=<path>/test_ping_targets.yaml
+ping_monitor:
+  ros__parameters:
+    targets:
+      - "localhost:127.0.0.1"
+      - "google_dns:8.8.8.8"
+      - "cloudflare_dns:1.1.1.1"
+      - "unreachable:192.0.2.1"
+    hardware_id: "ping.test"
+    poll_interval: 5.0
+    ping_count: 1
+    ping_timeout: 2.0
