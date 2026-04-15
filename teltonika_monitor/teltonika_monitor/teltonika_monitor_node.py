@@ -151,11 +151,11 @@ class TeltonikaMonitorNode(Node):
             return DiagnosticStatus.WARN, '?'
         if rsrp > -80:
             n = 5
-        elif rsrp > -90:
+        elif rsrp >= -90:
             n = 4
-        elif rsrp > -100:
+        elif rsrp >= -100:
             n = 3
-        elif rsrp > -110:
+        elif rsrp >= -110:
             n = 2
         else:
             n = 1

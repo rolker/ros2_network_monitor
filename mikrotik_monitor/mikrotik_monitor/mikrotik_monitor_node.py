@@ -246,11 +246,11 @@ class MikroTikMonitorNode(Node):
             return DiagnosticStatus.WARN, '?'
         if snr > 30:
             n = 5
-        elif snr > 20:
+        elif snr >= 20:
             n = 4
-        elif snr > 15:
+        elif snr >= 15:
             n = 3
-        elif snr > 10:
+        elif snr >= 10:
             n = 2
         else:
             n = 1
