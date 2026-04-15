@@ -23,6 +23,7 @@ class PingMonitorNode(Node):
         self.declare_parameter('poll_interval', 10.0)
         self.declare_parameter('ping_count', 3)
         self.declare_parameter('ping_timeout', 5.0)
+        self.declare_parameter('hardware_id', '')
 
         raw_targets = self.get_parameter('targets').value
         if not raw_targets:
@@ -59,6 +60,10 @@ class PingMonitorNode(Node):
         self.ping_timeout = self.get_parameter(
             'ping_timeout'
         ).value
+        self.hw_id = self.get_parameter('hardware_id').value
+        self._name_prefix = (
+            f'Ping: {self.hw_id}' if self.hw_id else 'Ping'
+        )
 
         self.diag_pub = self.create_publisher(
             DiagnosticArray, '/diagnostics', 10
@@ -132,8 +137,8 @@ class PingMonitorNode(Node):
             success, latency_ms, loss_pct = self._ping(address)
 
             status = DiagnosticStatus()
-            status.name = f'Ping: {name}'
-            status.hardware_id = address
+            status.name = f'{self._name_prefix}: {name}'
+            status.hardware_id = self.hw_id or address
 
             if not success:
                 status.level = DiagnosticStatus.ERROR
