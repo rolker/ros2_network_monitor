@@ -146,9 +146,12 @@ class PingMonitorNode(Node):
 
     def poll_callback(self):
         msg = DiagnosticArray()
-        query_time_iso = datetime.now(timezone.utc).isoformat()
 
         for name, address in self.targets:
+            # Stamp each target individually — pings are sequential and
+            # individual ping_count * ping_timeout windows can stretch
+            # the per-target loop across many seconds.
+            query_time_iso = datetime.now(timezone.utc).isoformat()
             success, latency_ms, loss_pct = self._ping(address)
 
             status = DiagnosticStatus()
