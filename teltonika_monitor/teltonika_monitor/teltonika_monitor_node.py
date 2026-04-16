@@ -24,6 +24,7 @@ class TeltonikaMonitorNode(Node):
         self.declare_parameter('publish_interval', 1.0)
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
+        self.declare_parameter('ignored_interfaces', [''])
 
         host = self.get_parameter('host').get_parameter_value().string_value
         if not host:
@@ -54,6 +55,15 @@ class TeltonikaMonitorNode(Node):
         verify_ssl = self.get_parameter(
             'verify_ssl'
         ).get_parameter_value().bool_value
+        # Denylist of interface names (applies to both network interface
+        # and mwan3 diagnostics) — used to suppress noise from
+        # intentionally unused interfaces.
+        self._ignored_interfaces = {
+            s for s in self.get_parameter(
+                'ignored_interfaces'
+            ).get_parameter_value().string_array_value
+            if s
+        }
 
         self.client = UbusClient(
             host=host,
@@ -250,6 +260,8 @@ class TeltonikaMonitorNode(Node):
 
         interfaces = mwan.get('interfaces', {})
         for name, data in interfaces.items():
+            if name in self._ignored_interfaces:
+                continue
             status = DiagnosticStatus()
             status.name = (
                 f'Teltonika: {self.hardware_id}: mwan3/{name}'
@@ -302,6 +314,8 @@ class TeltonikaMonitorNode(Node):
 
         for iface in result.get('interface', []):
             name = iface.get('interface', 'unknown')
+            if name in self._ignored_interfaces:
+                continue
             status = DiagnosticStatus()
             status.name = (
                 f'Teltonika: {self.hardware_id}: interface/{name}'

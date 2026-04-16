@@ -24,6 +24,7 @@ class MikroTikMonitorNode(Node):
         self.declare_parameter('publish_interval', 1.0)
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
+        self.declare_parameter('ignored_interfaces', [''])
 
         host = self.get_parameter('host').get_parameter_value().string_value
         if not host:
@@ -54,6 +55,14 @@ class MikroTikMonitorNode(Node):
         verify_ssl = self.get_parameter(
             'verify_ssl'
         ).get_parameter_value().bool_value
+        # Denylist of interface names whose diagnostics should not be
+        # published (e.g. unused ports that are intentionally down).
+        self._ignored_interfaces = {
+            s for s in self.get_parameter(
+                'ignored_interfaces'
+            ).get_parameter_value().string_array_value
+            if s
+        }
 
         self.client = RouterOSClient(
             host=host,
@@ -166,10 +175,13 @@ class MikroTikMonitorNode(Node):
     def _add_interface_diagnostics(self, msg: DiagnosticArray):
         interfaces = self.client.get_interfaces()
         for iface in interfaces:
+            iface_name = iface.get('name', 'unknown')
+            if iface_name in self._ignored_interfaces:
+                continue
             status = DiagnosticStatus()
             status.name = (
                 f'MikroTik: {self.hardware_id}: '
-                f'interface/{iface.get("name", "unknown")}'
+                f'interface/{iface_name}'
             )
             status.hardware_id = self.hardware_id
 
@@ -216,9 +228,11 @@ class MikroTikMonitorNode(Node):
             return
 
         for reg in registrations:
-            status = DiagnosticStatus()
             mac = reg.get('mac-address', 'unknown')
             interface = reg.get('interface', 'unknown')
+            if interface in self._ignored_interfaces:
+                continue
+            status = DiagnosticStatus()
             status.name = (
                 f'MikroTik: {self.hardware_id}: '
                 f'wireless/{interface}/{mac}'
