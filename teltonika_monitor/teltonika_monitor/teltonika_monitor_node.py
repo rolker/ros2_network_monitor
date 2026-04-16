@@ -272,6 +272,11 @@ class TeltonikaMonitorNode(Node):
             if wan_status == 'online':
                 status.level = DiagnosticStatus.OK
                 status.message = 'Online'
+            elif wan_status == 'standby':
+                # Standby is the expected steady state for a configured
+                # backup interface while the primary is up — not a warning.
+                status.level = DiagnosticStatus.OK
+                status.message = 'Standby'
             elif wan_status == 'offline':
                 status.level = DiagnosticStatus.ERROR
                 status.message = 'Offline'
