@@ -74,10 +74,12 @@ class PingMonitorNode(Node):
             DiagnosticArray, '/diagnostics', 10
         )
 
-        # Cache of the most recent successful poll. Republished at
-        # publish_interval so downstream consumers (rqt_runtime_monitor's
-        # 5 s stale window, aggregator analyzers, annunciator stale
-        # timeouts) don't see false STALE between polls.
+        # Cache of the most recent poll result (success or failure).
+        # Republished at publish_interval so downstream consumers
+        # (rqt_runtime_monitor's 5 s stale window, aggregator analyzers,
+        # annunciator stale timeouts) don't see false STALE between
+        # polls. Unreachable targets surface as ERROR statuses that get
+        # cached and persistently republished until the next poll.
         self._cached_msg: DiagnosticArray | None = None
 
         self.poll_timer = self.create_timer(
