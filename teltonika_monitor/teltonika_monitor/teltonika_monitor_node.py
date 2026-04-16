@@ -82,8 +82,11 @@ class TeltonikaMonitorNode(Node):
             DiagnosticArray, '/diagnostics', 10
         )
 
-        # Cache of the most recent successful poll; republished at
-        # publish_interval to avoid false STALE in downstream consumers.
+        # Cache of the most recent poll result (success or failure);
+        # republished at publish_interval to avoid false STALE in
+        # downstream consumers. On client error the cached message
+        # carries the ERROR status so subscribers see the router is
+        # down persistently between retries.
         self._cached_msg: DiagnosticArray | None = None
 
         self.poll_timer = self.create_timer(
