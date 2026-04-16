@@ -1,6 +1,12 @@
 """ROS 2 node that polls a Teltonika router and publishes diagnostics."""
 
+import threading
+from datetime import datetime, timezone
+
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 
@@ -19,8 +25,13 @@ class TeltonikaMonitorNode(Node):
         self.declare_parameter('port', 443)
         self.declare_parameter('use_ssl', True)
         self.declare_parameter('poll_interval', 5.0)
+        self.declare_parameter('publish_interval', 1.0)
+        self.declare_parameter('max_data_age_s', 0.0)
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
+        self.declare_parameter(
+            'ignored_interfaces', rclpy.Parameter.Type.STRING_ARRAY
+        )
 
         host = self.get_parameter('host').get_parameter_value().string_value
         if not host:
@@ -42,12 +53,23 @@ class TeltonikaMonitorNode(Node):
         poll_interval = self.get_parameter(
             'poll_interval'
         ).get_parameter_value().double_value
+        publish_interval = self.get_parameter(
+            'publish_interval'
+        ).get_parameter_value().double_value
         self.hardware_id = self.get_parameter(
             'hardware_id'
         ).get_parameter_value().string_value
         verify_ssl = self.get_parameter(
             'verify_ssl'
         ).get_parameter_value().bool_value
+        # Denylist of interface names (applies to both network interface
+        # and mwan3 diagnostics) — used to suppress noise from
+        # intentionally unused interfaces.
+        self._ignored_interfaces = set(
+            self.get_parameter(
+                'ignored_interfaces'
+            ).get_parameter_value().string_array_value
+        )
 
         self.client = UbusClient(
             host=host,
@@ -65,15 +87,51 @@ class TeltonikaMonitorNode(Node):
             DiagnosticArray, '/diagnostics', 10
         )
 
-        self.timer = self.create_timer(poll_interval, self.poll_callback)
+        # Cache of the most recent poll result (success or failure);
+        # republished at publish_interval to avoid false STALE in
+        # downstream consumers. On client error the cached message
+        # carries the ERROR status so subscribers see the router is
+        # down persistently between retries.
+        self._cached_msg: DiagnosticArray | None = None
+        self._last_poll_time = None
+        self._cache_lock = threading.Lock()
+
+        # Stale threshold: if no successful poll within max_data_age_s,
+        # republished statuses are downgraded to STALE so consumers that
+        # only read DiagnosticStatus.level (not the last_query_time
+        # KeyValue) still see real polling stalls. 0 = auto, 3*poll.
+        max_data_age_s = self.get_parameter(
+            'max_data_age_s'
+        ).get_parameter_value().double_value
+        if max_data_age_s <= 0.0:
+            max_data_age_s = 3.0 * poll_interval
+        self._max_data_age = Duration(seconds=max_data_age_s)
+
+        # Separate callback groups so the publish timer can run while a
+        # slow poll is in progress — required by the MultiThreadedExecutor
+        # in main(). Multiple sequential ubus JSON-RPC calls per poll
+        # can stall for tens of seconds when the router is unreachable;
+        # without the split the publish_interval guarantee would be
+        # broken exactly when downstream consumers most need fresh data.
+        self.poll_timer = self.create_timer(
+            poll_interval,
+            self.poll_callback,
+            callback_group=MutuallyExclusiveCallbackGroup(),
+        )
+        self.publish_timer = self.create_timer(
+            publish_interval,
+            self._publish_callback,
+            callback_group=MutuallyExclusiveCallbackGroup(),
+        )
         self.get_logger().info(
             f'Monitoring Teltonika router at {host}:{port} '
-            f'every {poll_interval}s'
+            f'poll every {poll_interval}s, '
+            f'publish every {publish_interval}s'
         )
 
     def poll_callback(self):
         msg = DiagnosticArray()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        query_time_iso = datetime.now(timezone.utc).isoformat()
 
         try:
             self._add_system_diagnostics(msg)
@@ -88,6 +146,35 @@ class TeltonikaMonitorNode(Node):
             status.message = f'Connection error: {e}'
             msg.status.append(status)
             self.get_logger().warning(f'Failed to poll router: {e}')
+
+        # Stamp every status with the actual query time so observers can
+        # compute true data age across republishes.
+        for status in msg.status:
+            status.values.append(
+                KeyValue(key='last_query_time', value=query_time_iso)
+            )
+        with self._cache_lock:
+            self._cached_msg = msg
+            self._last_poll_time = self.get_clock().now()
+
+    def _publish_callback(self):
+        with self._cache_lock:
+            msg = self._cached_msg
+            last_poll = self._last_poll_time
+        if msg is None:
+            return
+
+        now = self.get_clock().now()
+        msg.header.stamp = now.to_msg()
+
+        # Downgrade levels to STALE if the cached data is older than
+        # max_data_age. Consumers that only read status.level (not the
+        # last_query_time KeyValue) need this to detect polling stalls.
+        if last_poll is not None and (now - last_poll) > self._max_data_age:
+            age_s = (now - last_poll).nanoseconds / 1e9
+            for status in msg.status:
+                status.level = DiagnosticStatus.STALE
+                status.message = f'STALE: {age_s:.1f}s since last poll'
 
         self.diag_pub.publish(msg)
 
@@ -221,6 +308,8 @@ class TeltonikaMonitorNode(Node):
 
         interfaces = mwan.get('interfaces', {})
         for name, data in interfaces.items():
+            if name in self._ignored_interfaces:
+                continue
             status = DiagnosticStatus()
             status.name = (
                 f'Teltonika: {self.hardware_id}: mwan3/{name}'
@@ -231,6 +320,11 @@ class TeltonikaMonitorNode(Node):
             if wan_status == 'online':
                 status.level = DiagnosticStatus.OK
                 status.message = 'Online'
+            elif wan_status == 'standby':
+                # Standby is the expected steady state for a configured
+                # backup interface while the primary is up — not a warning.
+                status.level = DiagnosticStatus.OK
+                status.message = 'Standby'
             elif wan_status == 'offline':
                 status.level = DiagnosticStatus.ERROR
                 status.message = 'Offline'
@@ -273,6 +367,8 @@ class TeltonikaMonitorNode(Node):
 
         for iface in result.get('interface', []):
             name = iface.get('interface', 'unknown')
+            if name in self._ignored_interfaces:
+                continue
             status = DiagnosticStatus()
             status.name = (
                 f'Teltonika: {self.hardware_id}: interface/{name}'
@@ -309,10 +405,13 @@ class TeltonikaMonitorNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = TeltonikaMonitorNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.try_shutdown()
