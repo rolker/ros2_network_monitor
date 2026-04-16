@@ -8,6 +8,7 @@
 
 import math
 import subprocess
+from datetime import datetime, timezone
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 import rclpy
@@ -21,6 +22,7 @@ class PingMonitorNode(Node):
 
         self.declare_parameter('targets', rclpy.Parameter.Type.STRING_ARRAY)
         self.declare_parameter('poll_interval', 10.0)
+        self.declare_parameter('publish_interval', 1.0)
         self.declare_parameter('ping_count', 3)
         self.declare_parameter('ping_timeout', 5.0)
         self.declare_parameter('hardware_id', '')
@@ -54,6 +56,9 @@ class PingMonitorNode(Node):
         self.poll_interval = self.get_parameter(
             'poll_interval'
         ).value
+        publish_interval = self.get_parameter(
+            'publish_interval'
+        ).value
         self.ping_count = self.get_parameter(
             'ping_count'
         ).value
@@ -69,14 +74,24 @@ class PingMonitorNode(Node):
             DiagnosticArray, '/diagnostics', 10
         )
 
-        self.timer = self.create_timer(
+        # Cache of the most recent successful poll. Republished at
+        # publish_interval so downstream consumers (rqt_runtime_monitor's
+        # 5 s stale window, aggregator analyzers, annunciator stale
+        # timeouts) don't see false STALE between polls.
+        self._cached_msg: DiagnosticArray | None = None
+
+        self.poll_timer = self.create_timer(
             self.poll_interval, self.poll_callback
+        )
+        self.publish_timer = self.create_timer(
+            publish_interval, self._publish_callback
         )
 
         target_names = ', '.join(n for n, _ in self.targets)
         self.get_logger().info(
             f'Ping monitor started: [{target_names}] '
-            f'every {self.poll_interval}s'
+            f'poll every {self.poll_interval}s, '
+            f'publish every {publish_interval}s'
         )
 
     def _ping(self, address):
@@ -131,7 +146,7 @@ class PingMonitorNode(Node):
 
     def poll_callback(self):
         msg = DiagnosticArray()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        query_time_iso = datetime.now(timezone.utc).isoformat()
 
         for name, address in self.targets:
             success, latency_ms, loss_pct = self._ping(address)
@@ -165,10 +180,21 @@ class PingMonitorNode(Node):
             status.values.append(
                 KeyValue(key='ping_count', value=str(self.ping_count))
             )
+            status.values.append(
+                KeyValue(key='last_query_time', value=query_time_iso)
+            )
 
             msg.status.append(status)
 
-        self.diag_pub.publish(msg)
+        self._cached_msg = msg
+
+    def _publish_callback(self):
+        if self._cached_msg is None:
+            return
+        # Refresh send timestamp; per-status last_query_time is left intact
+        # so observers can compute true data age.
+        self._cached_msg.header.stamp = self.get_clock().now().to_msg()
+        self.diag_pub.publish(self._cached_msg)
 
 
 def main(args=None):

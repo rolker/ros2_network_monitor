@@ -1,5 +1,7 @@
 """ROS 2 node that polls a MikroTik device and publishes diagnostics."""
 
+from datetime import datetime, timezone
+
 import rclpy
 from rclpy.node import Node
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
@@ -19,6 +21,7 @@ class MikroTikMonitorNode(Node):
         self.declare_parameter('port', 80)
         self.declare_parameter('use_ssl', False)
         self.declare_parameter('poll_interval', 5.0)
+        self.declare_parameter('publish_interval', 1.0)
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
 
@@ -41,6 +44,9 @@ class MikroTikMonitorNode(Node):
         ).get_parameter_value().bool_value
         poll_interval = self.get_parameter(
             'poll_interval'
+        ).get_parameter_value().double_value
+        publish_interval = self.get_parameter(
+            'publish_interval'
         ).get_parameter_value().double_value
         self.hardware_id = self.get_parameter(
             'hardware_id'
@@ -66,15 +72,25 @@ class MikroTikMonitorNode(Node):
             DiagnosticArray, '/diagnostics', 10
         )
 
-        self.timer = self.create_timer(poll_interval, self.poll_callback)
+        # Cache of the most recent successful poll; republished at
+        # publish_interval to avoid false STALE in downstream consumers.
+        self._cached_msg: DiagnosticArray | None = None
+
+        self.poll_timer = self.create_timer(
+            poll_interval, self.poll_callback
+        )
+        self.publish_timer = self.create_timer(
+            publish_interval, self._publish_callback
+        )
         self.get_logger().info(
             f'Monitoring MikroTik device at {host}:{port} '
-            f'every {poll_interval}s'
+            f'poll every {poll_interval}s, '
+            f'publish every {publish_interval}s'
         )
 
     def poll_callback(self):
         msg = DiagnosticArray()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        query_time_iso = datetime.now(timezone.utc).isoformat()
 
         try:
             self._add_system_diagnostics(msg)
@@ -90,7 +106,20 @@ class MikroTikMonitorNode(Node):
             msg.status.append(status)
             self.get_logger().warning(f'Failed to poll device: {e}')
 
-        self.diag_pub.publish(msg)
+        # Stamp every status with the actual query time so observers can
+        # compute true data age across republishes.
+        for status in msg.status:
+            status.values.append(
+                KeyValue(key='last_query_time', value=query_time_iso)
+            )
+        self._cached_msg = msg
+
+    def _publish_callback(self):
+        if self._cached_msg is None:
+            return
+        # Refresh send timestamp; per-status last_query_time is left intact.
+        self._cached_msg.header.stamp = self.get_clock().now().to_msg()
+        self.diag_pub.publish(self._cached_msg)
 
     def _add_system_diagnostics(self, msg: DiagnosticArray):
         resource = self.client.get_system_resource()
