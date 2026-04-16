@@ -24,7 +24,9 @@ class TeltonikaMonitorNode(Node):
         self.declare_parameter('publish_interval', 1.0)
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
-        self.declare_parameter('ignored_interfaces', [''])
+        self.declare_parameter(
+            'ignored_interfaces', rclpy.Parameter.Type.STRING_ARRAY
+        )
 
         host = self.get_parameter('host').get_parameter_value().string_value
         if not host:
@@ -58,12 +60,11 @@ class TeltonikaMonitorNode(Node):
         # Denylist of interface names (applies to both network interface
         # and mwan3 diagnostics) — used to suppress noise from
         # intentionally unused interfaces.
-        self._ignored_interfaces = {
-            s for s in self.get_parameter(
+        self._ignored_interfaces = set(
+            self.get_parameter(
                 'ignored_interfaces'
             ).get_parameter_value().string_array_value
-            if s
-        }
+        )
 
         self.client = UbusClient(
             host=host,

@@ -24,7 +24,9 @@ class MikroTikMonitorNode(Node):
         self.declare_parameter('publish_interval', 1.0)
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
-        self.declare_parameter('ignored_interfaces', [''])
+        self.declare_parameter(
+            'ignored_interfaces', rclpy.Parameter.Type.STRING_ARRAY
+        )
 
         host = self.get_parameter('host').get_parameter_value().string_value
         if not host:
@@ -57,12 +59,11 @@ class MikroTikMonitorNode(Node):
         ).get_parameter_value().bool_value
         # Denylist of interface names whose diagnostics should not be
         # published (e.g. unused ports that are intentionally down).
-        self._ignored_interfaces = {
-            s for s in self.get_parameter(
+        self._ignored_interfaces = set(
+            self.get_parameter(
                 'ignored_interfaces'
             ).get_parameter_value().string_array_value
-            if s
-        }
+        )
 
         self.client = RouterOSClient(
             host=host,
