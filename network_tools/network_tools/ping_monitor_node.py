@@ -8,10 +8,13 @@
 
 import math
 import subprocess
+import threading
 from datetime import datetime, timezone
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 
@@ -81,12 +84,23 @@ class PingMonitorNode(Node):
         # polls. Unreachable targets surface as ERROR statuses that get
         # cached and persistently republished until the next poll.
         self._cached_msg: DiagnosticArray | None = None
+        self._cache_lock = threading.Lock()
 
+        # Separate callback groups so the publish timer can run while a
+        # slow poll is in progress — required by the MultiThreadedExecutor
+        # in main(). With per-target ping deadlines of ping_count *
+        # ping_timeout, a single poll can block for many seconds; without
+        # the split the publish_interval guarantee would be broken
+        # exactly when downstream consumers most need fresh data.
         self.poll_timer = self.create_timer(
-            self.poll_interval, self.poll_callback
+            self.poll_interval,
+            self.poll_callback,
+            callback_group=MutuallyExclusiveCallbackGroup(),
         )
         self.publish_timer = self.create_timer(
-            publish_interval, self._publish_callback
+            publish_interval,
+            self._publish_callback,
+            callback_group=MutuallyExclusiveCallbackGroup(),
         )
 
         target_names = ', '.join(n for n, _ in self.targets)
@@ -191,24 +205,30 @@ class PingMonitorNode(Node):
 
             msg.status.append(status)
 
-        self._cached_msg = msg
+        with self._cache_lock:
+            self._cached_msg = msg
 
     def _publish_callback(self):
-        if self._cached_msg is None:
+        with self._cache_lock:
+            msg = self._cached_msg
+        if msg is None:
             return
         # Refresh send timestamp; per-status last_query_time is left intact
         # so observers can compute true data age.
-        self._cached_msg.header.stamp = self.get_clock().now().to_msg()
-        self.diag_pub.publish(self._cached_msg)
+        msg.header.stamp = self.get_clock().now().to_msg()
+        self.diag_pub.publish(msg)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = PingMonitorNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.try_shutdown()

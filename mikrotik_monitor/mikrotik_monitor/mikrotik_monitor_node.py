@@ -1,8 +1,11 @@
 """ROS 2 node that polls a MikroTik device and publishes diagnostics."""
 
+import threading
 from datetime import datetime, timezone
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 
@@ -88,12 +91,23 @@ class MikroTikMonitorNode(Node):
         # carries the ERROR status so subscribers see the device is
         # down persistently between retries.
         self._cached_msg: DiagnosticArray | None = None
+        self._cache_lock = threading.Lock()
 
+        # Separate callback groups so the publish timer can run while a
+        # slow poll is in progress — required by the MultiThreadedExecutor
+        # in main(). RouterOSClient HTTP requests can stall for tens of
+        # seconds when the device is unreachable; without the split the
+        # publish_interval guarantee would be broken exactly when
+        # downstream consumers most need fresh data.
         self.poll_timer = self.create_timer(
-            poll_interval, self.poll_callback
+            poll_interval,
+            self.poll_callback,
+            callback_group=MutuallyExclusiveCallbackGroup(),
         )
         self.publish_timer = self.create_timer(
-            publish_interval, self._publish_callback
+            publish_interval,
+            self._publish_callback,
+            callback_group=MutuallyExclusiveCallbackGroup(),
         )
         self.get_logger().info(
             f'Monitoring MikroTik device at {host}:{port} '
@@ -125,14 +139,17 @@ class MikroTikMonitorNode(Node):
             status.values.append(
                 KeyValue(key='last_query_time', value=query_time_iso)
             )
-        self._cached_msg = msg
+        with self._cache_lock:
+            self._cached_msg = msg
 
     def _publish_callback(self):
-        if self._cached_msg is None:
+        with self._cache_lock:
+            msg = self._cached_msg
+        if msg is None:
             return
         # Refresh send timestamp; per-status last_query_time is left intact.
-        self._cached_msg.header.stamp = self.get_clock().now().to_msg()
-        self.diag_pub.publish(self._cached_msg)
+        msg.header.stamp = self.get_clock().now().to_msg()
+        self.diag_pub.publish(msg)
 
     def _add_system_diagnostics(self, msg: DiagnosticArray):
         resource = self.client.get_system_resource()
@@ -314,10 +331,13 @@ class MikroTikMonitorNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = MikroTikMonitorNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.try_shutdown()
