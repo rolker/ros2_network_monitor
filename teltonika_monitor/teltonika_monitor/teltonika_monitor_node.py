@@ -29,9 +29,7 @@ class TeltonikaMonitorNode(Node):
         self.declare_parameter('max_data_age_s', 0.0)
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
-        self.declare_parameter(
-            'ignored_interfaces', rclpy.Parameter.Type.STRING_ARRAY
-        )
+        self.declare_parameter('ignored_interfaces', [])
 
         host = self.get_parameter('host').get_parameter_value().string_value
         if not host:
