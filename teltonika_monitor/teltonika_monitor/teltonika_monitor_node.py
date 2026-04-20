@@ -30,6 +30,7 @@ class TeltonikaMonitorNode(Node):
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
         self.declare_parameter('ignored_interfaces', [])
+        self.declare_parameter('publish_cellular', True)
 
         host = self.get_parameter('host').get_parameter_value().string_value
         if not host:
@@ -68,6 +69,12 @@ class TeltonikaMonitorNode(Node):
                 'ignored_interfaces'
             ).get_parameter_value().string_array_value
         )
+        # Routers without a SIM (or whose cellular status is not
+        # meaningful for the deployment) can suppress the cellular
+        # DiagnosticStatus entirely rather than report "No service".
+        self._publish_cellular = self.get_parameter(
+            'publish_cellular'
+        ).get_parameter_value().bool_value
 
         self.client = UbusClient(
             host=host,
@@ -133,7 +140,8 @@ class TeltonikaMonitorNode(Node):
 
         try:
             self._add_system_diagnostics(msg)
-            self._add_cellular_diagnostics(msg)
+            if self._publish_cellular:
+                self._add_cellular_diagnostics(msg)
             self._add_mwan3_diagnostics(msg)
             self._add_interface_diagnostics(msg)
         except UbusClientError as e:
