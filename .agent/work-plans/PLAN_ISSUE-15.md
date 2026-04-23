@@ -144,18 +144,17 @@ Keep it: `_apply_common_kv` reads `cache.poll_wall_iso` and appends
 
 ### 6. Align timing parameters with Starlink
 
-| Param | Default | Semantics |
-|---|---|---|
-| `poll_interval_sec` | existing per-monitor default | How often to poll the remote device |
-| `update_period_sec` | 1.0 | `diagnostic_updater.Updater` publish cadence |
-| `stale_timeout_sec` | 5.0 | Cache-age threshold above which tasks emit STALE |
+| Old param (all three nodes) | New param | Default | Semantics |
+|---|---|---|---|
+| `max_data_age_s` | `stale_timeout_sec` | 5.0 | Cache-age threshold above which tasks emit STALE |
+| `publish_interval` | `update_period_sec` | 1.0 | `diagnostic_updater.Updater` publish cadence |
+| `poll_interval` | `poll_interval_sec` (unchanged meaning) | existing per-monitor default | How often to poll the remote device; renamed only for `_sec` suffix consistency |
 
-Retire `max_data_age` (the old name) in favor of `stale_timeout_sec`
-to match Starlink exactly. Retire `publish_interval` in favor of
-`update_period_sec`. Retain the old parameter *names* as deprecated
-aliases for one release to not break existing launch configs — node
-logs a WARN when the old name is used. (Open question: do we have
-field deployments that pass these explicitly? If not, skip the alias.)
+**No deprecated-alias path.** A workspace grep confirmed no launch files
+or YAML configs anywhere in the workspace pass `max_data_age_s` or
+`publish_interval` externally — every reference is inside the three
+monitor nodes' own `declare_parameter` calls. Rename cleanly and
+document the rename in the PR body.
 
 ### 7. Consider `rqt_operator_tools#14` incidentally
 
@@ -194,7 +193,7 @@ on a separate issue.
 | **Improve incrementally** | Three monitors migrate in the same PR because they share the new helper shape and should land together to keep the pattern consistent. Each monitor's change is independently readable; commits kept per-monitor for reviewability. |
 | **Test what breaks** | Regression tests specifically cover the error → success schema-drift scenario. Pure-logic tests (no rclpy context) mirror Starlink's `diagnostics_logic` coverage depth. |
 | **Workspace vs project separation** | N/A — this is work inside a project repo. |
-| **Human control and transparency** | Param name changes (`max_data_age` → `stale_timeout_sec`) flagged in PR body and documented. Deprecated-alias warning path makes transition visible. |
+| **Human control and transparency** | Param name changes (`max_data_age_s` → `stale_timeout_sec`, `publish_interval` → `update_period_sec`) flagged in PR body. Clean rename with no aliases because workspace grep confirmed no external callers. |
 
 ## ADR Compliance
 
@@ -210,22 +209,22 @@ on a separate issue.
 | If we change... | Also update... | Included in plan? |
 |---|---|---|
 | Diagnostic task names (`MikroTik: <hwid>` → `: connection`) | Any annunciator config that exact-matched the old summary name | **PR description** lists the name change and notes config-side migration. Separate PRs on consumer repos (if any) will follow. |
-| Parameter names (`max_data_age` → `stale_timeout_sec`) | Any launch file or YAML config passing the old names | Deprecated-alias behavior retained for one release; log WARN on use. |
+| Parameter names (`max_data_age_s` → `stale_timeout_sec`; `publish_interval` → `update_period_sec`) | Any launch file or YAML config passing the old names | Workspace grep confirmed no external callers. Rename cleanly; document in PR body. |
 | `package.xml` deps (add `diagnostic_updater`) | `rosdep` database on deployment machines (pre-existing dep — already installed for Starlink) | No separate deploy step needed. |
 | Extract pure logic into `*_logic.py` modules | Imports in any external code using internal monitor modules | None known — modules are currently all internal. |
 
 ## Open Questions
 
-1. **Deprecated-alias behavior for old params.** Do we have field launch
-   configs passing `max_data_age` or `publish_interval` explicitly? If
-   not, the alias code is dead weight — skip it and break cleanly. A grep
-   across the workspace for these names should answer this before we
-   write the alias path.
+1. ~~**Deprecated-alias behavior for old params.**~~ **Resolved.**
+   Workspace grep (2026-04-23) across `layers/main/**/*.{py,yaml,yml,launch*,xml}`
+   found zero external callers of `max_data_age_s` or `publish_interval` —
+   every reference is inside the three monitor nodes' own
+   `declare_parameter` calls. No alias path needed.
 2. **Dynamic-membership grace period.** How many missed polls before
    `removeByName` is called on a disappeared interface? Proposal above
-   says `max_data_age * 2`. Reasonable? A field observation of how often
-   interfaces transiently flap would inform this; for now default to 2×
-   and let it be tunable.
+   says `stale_timeout_sec * 2`. Reasonable? A field observation of how
+   often interfaces transiently flap would inform this; for now default
+   to 2× and let it be tunable via a `dynamic_task_grace_sec` param.
 3. **One PR or three?** Leaning "one PR, three commits" — the helper
    extraction is shared enough that splitting three ways duplicates
    review. But if Claude Code loses signal on PR size during review,
