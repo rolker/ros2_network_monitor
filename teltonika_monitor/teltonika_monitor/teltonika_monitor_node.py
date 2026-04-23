@@ -1,15 +1,44 @@
-"""ROS 2 node that polls a Teltonika router and publishes diagnostics."""
+# Copyright 2024 Roland Arsenault
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file or at
+# https://developers.google.com/open-source/licenses/bsd
 
-import threading
+"""
+ROS 2 node that polls a Teltonika router and publishes diagnostics.
+
+Uses ``diagnostic_updater.Updater`` so tasks publish at a steady cadence
+regardless of how long the sequence of ubus JSON-RPC calls takes.  Poll
+callback only updates a ``CachedStatus`` snapshot; per-task callbacks
+render ``DiagnosticStatus`` from the cache via
+:mod:`teltonika_monitor.diagnostics_logic`.
+
+Fixed tasks: ``: connection``, ``: system``, and ``: cellular`` (when
+``publish_cellular=True``).  Per-mwan3-member and per-interface tasks
+are added/removed dynamically via ``Updater.add`` / ``Updater.removeByName``
+with a grace period to absorb transient flaps.
+"""
+
 from datetime import datetime, timezone
+import threading
+import time
 
+import diagnostic_updater
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
-
+from teltonika_monitor.diagnostics_logic import (
+    CachedStatus,
+    diff_dynamic_membership,
+    interface_task_name,
+    mwan3_task_name,
+    synthesize_cellular_status,
+    synthesize_connection_status,
+    synthesize_interface_status,
+    synthesize_mwan3_status,
+    synthesize_system_status,
+)
 from teltonika_monitor.ubus_client import UbusClient, UbusClientError
 
 
@@ -18,15 +47,15 @@ class TeltonikaMonitorNode(Node):
     def __init__(self):
         super().__init__('teltonika_monitor')
 
-        # Parameters
         self.declare_parameter('host', '')
         self.declare_parameter('username', 'ros_monitor')
         self.declare_parameter('password', '')
         self.declare_parameter('port', 443)
         self.declare_parameter('use_ssl', True)
         self.declare_parameter('poll_interval', 5.0)
-        self.declare_parameter('publish_interval', 1.0)
-        self.declare_parameter('max_data_age_s', 0.0)
+        self.declare_parameter('update_period_sec', 1.0)
+        self.declare_parameter('stale_timeout_sec', 0.0)
+        self.declare_parameter('dynamic_task_grace_sec', 0.0)
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
         self.declare_parameter('ignored_interfaces', [])
@@ -52,8 +81,8 @@ class TeltonikaMonitorNode(Node):
         poll_interval = self.get_parameter(
             'poll_interval'
         ).get_parameter_value().double_value
-        publish_interval = self.get_parameter(
-            'publish_interval'
+        update_period_sec = self.get_parameter(
+            'update_period_sec'
         ).get_parameter_value().double_value
         self.hardware_id = self.get_parameter(
             'hardware_id'
@@ -61,17 +90,11 @@ class TeltonikaMonitorNode(Node):
         verify_ssl = self.get_parameter(
             'verify_ssl'
         ).get_parameter_value().bool_value
-        # Denylist of interface names (applies to both network interface
-        # and mwan3 diagnostics) — used to suppress noise from
-        # intentionally unused interfaces.
         self._ignored_interfaces = set(
             self.get_parameter(
                 'ignored_interfaces'
             ).get_parameter_value().string_array_value
         )
-        # Routers without a SIM (or whose cellular status is not
-        # meaningful for the deployment) can suppress the cellular
-        # DiagnosticStatus entirely rather than report "No service".
         self._publish_cellular = self.get_parameter(
             'publish_cellular'
         ).get_parameter_value().bool_value
@@ -88,324 +111,248 @@ class TeltonikaMonitorNode(Node):
         if not self.hardware_id:
             self.hardware_id = host
 
-        self.diag_pub = self.create_publisher(
-            DiagnosticArray, '/diagnostics', 10
-        )
-
-        # Cache of the most recent poll result (success or failure);
-        # republished at publish_interval to avoid false STALE in
-        # downstream consumers. On client error the cached message
-        # carries the ERROR status so subscribers see the router is
-        # down persistently between retries.
-        self._cached_msg: DiagnosticArray | None = None
-        self._last_poll_time = None
-        self._cache_lock = threading.Lock()
-
-        # Stale threshold: if no successful poll within max_data_age_s,
-        # republished statuses are downgraded to STALE so consumers that
-        # only read DiagnosticStatus.level (not the last_query_time
-        # KeyValue) still see real polling stalls. 0 = auto, 3*poll.
-        max_data_age_s = self.get_parameter(
-            'max_data_age_s'
+        stale_timeout_sec = self.get_parameter(
+            'stale_timeout_sec'
         ).get_parameter_value().double_value
-        if max_data_age_s <= 0.0:
-            max_data_age_s = 3.0 * poll_interval
-        self._max_data_age = Duration(seconds=max_data_age_s)
+        if stale_timeout_sec <= 0.0:
+            stale_timeout_sec = 3.0 * poll_interval
+        self._stale_timeout_sec = stale_timeout_sec
 
-        # Separate callback groups so the publish timer can run while a
-        # slow poll is in progress — required by the MultiThreadedExecutor
-        # in main(). Multiple sequential ubus JSON-RPC calls per poll
-        # can stall for tens of seconds when the router is unreachable;
-        # without the split the publish_interval guarantee would be
-        # broken exactly when downstream consumers most need fresh data.
+        # dynamic_task_grace_sec = 0 → auto (2 × stale_timeout_sec).
+        # Field-tunable; first long deployment should observe
+        # transient-flap frequency and inform a better default.
+        grace_sec = self.get_parameter(
+            'dynamic_task_grace_sec'
+        ).get_parameter_value().double_value
+        if grace_sec <= 0.0:
+            grace_sec = 2.0 * stale_timeout_sec
+        self._dynamic_task_grace_sec = grace_sec
+
+        self._name_prefix = f'Teltonika: {self.hardware_id}'
+
+        self._cache_lock = threading.Lock()
+        self._cache = CachedStatus()
+        self._mwan3_last_seen: dict[str, float] = {}
+        self._iface_last_seen: dict[str, float] = {}
+
+        self._updater = diagnostic_updater.Updater(
+            self, period=update_period_sec,
+        )
+        self._updater.setHardwareID(self.hardware_id)
+
+        # Fixed tasks — always registered.
+        self._updater.add(
+            f'{self._name_prefix}: connection',
+            self._task_connection,
+        )
+        self._updater.add(
+            f'{self._name_prefix}: system',
+            self._task_system,
+        )
+        if self._publish_cellular:
+            self._updater.add(
+                f'{self._name_prefix}: cellular',
+                self._task_cellular,
+            )
+
         self.poll_timer = self.create_timer(
             poll_interval,
-            self.poll_callback,
+            self._poll_callback,
             callback_group=MutuallyExclusiveCallbackGroup(),
         )
-        self.publish_timer = self.create_timer(
-            publish_interval,
-            self._publish_callback,
-            callback_group=MutuallyExclusiveCallbackGroup(),
-        )
+
         self.get_logger().info(
             f'Monitoring Teltonika router at {host}:{port} '
             f'poll every {poll_interval}s, '
-            f'publish every {publish_interval}s'
+            f'publish every {update_period_sec}s, '
+            f'stale_timeout={self._stale_timeout_sec}s, '
+            f'dynamic_task_grace={self._dynamic_task_grace_sec}s'
         )
 
-    def poll_callback(self):
-        msg = DiagnosticArray()
-        query_time_iso = datetime.now(timezone.utc).isoformat()
+    # --- Task callbacks ---
+
+    def _task_connection(self, stat):
+        level, message, kvs = synthesize_connection_status(
+            self._cache_snapshot(),
+            self._stale_timeout_sec,
+            time.monotonic(),
+        )
+        return _emit(stat, level, message, kvs)
+
+    def _task_system(self, stat):
+        level, message, kvs = synthesize_system_status(
+            self._cache_snapshot(),
+            self._stale_timeout_sec,
+            time.monotonic(),
+        )
+        return _emit(stat, level, message, kvs)
+
+    def _task_cellular(self, stat):
+        level, message, kvs = synthesize_cellular_status(
+            self._cache_snapshot(),
+            self._stale_timeout_sec,
+            time.monotonic(),
+        )
+        return _emit(stat, level, message, kvs)
+
+    def _make_mwan3_task(self, mwan_name: str):
+        def _task(stat):
+            level, message, kvs = synthesize_mwan3_status(
+                self._cache_snapshot(),
+                mwan_name,
+                self._stale_timeout_sec,
+                time.monotonic(),
+            )
+            return _emit(stat, level, message, kvs)
+        return _task
+
+    def _make_interface_task(self, iface_name: str):
+        def _task(stat):
+            level, message, kvs = synthesize_interface_status(
+                self._cache_snapshot(),
+                iface_name,
+                self._stale_timeout_sec,
+                time.monotonic(),
+            )
+            return _emit(stat, level, message, kvs)
+        return _task
+
+    def _cache_snapshot(self) -> CachedStatus:
+        with self._cache_lock:
+            return self._cache
+
+    # --- Polling ---
+
+    def _poll_callback(self):
+        """Fetch the latest router state; update cache and dynamic tasks."""
+        poll_wall_iso = datetime.now(timezone.utc).isoformat()
+        error_message = None
+        system_board = None
+        cellular_signal = None
+        cellular_supported = True
+        mwan3 = None
+        mwan3_supported = True
+        network_interfaces: list[dict] = []
 
         try:
-            self._add_system_diagnostics(msg)
+            system_board = self.client.get_system_board()
+
             if self._publish_cellular:
-                self._add_cellular_diagnostics(msg)
-            self._add_mwan3_diagnostics(msg)
-            self._add_interface_diagnostics(msg)
+                try:
+                    cellular_signal = self.client.get_signal()
+                except UbusClientError as e:
+                    if e.code == 3:
+                        cellular_supported = False
+                    else:
+                        self.get_logger().warning(
+                            f'Failed to query cellular signal: {e}'
+                        )
+                        cellular_signal = None
+
+            try:
+                mwan3 = self.client.get_mwan3_status()
+            except UbusClientError as e:
+                if e.code == 3:
+                    mwan3_supported = False
+                else:
+                    self.get_logger().warning(
+                        f'Failed to query mwan3 status: {e}'
+                    )
+                    mwan3 = None
+
+            try:
+                result = self.client.get_network_interfaces()
+                network_interfaces = [
+                    i for i in result.get('interface', [])
+                    if i.get('interface', 'unknown') not in self._ignored_interfaces
+                ]
+            except UbusClientError as e:
+                if e.code != 3:
+                    self.get_logger().warning(
+                        f'Failed to query network interfaces: {e}'
+                    )
+                network_interfaces = []
         except UbusClientError as e:
-            status = DiagnosticStatus()
-            status.level = DiagnosticStatus.ERROR
-            status.name = f'Teltonika: {self.hardware_id}'
-            status.hardware_id = self.hardware_id
-            status.message = f'Connection error: {e}'
-            msg.status.append(status)
+            error_message = f'Connection error: {e}'
             self.get_logger().warning(f'Failed to poll router: {e}')
 
-        # Stamp every status with the actual query time so observers can
-        # compute true data age across republishes.
-        for status in msg.status:
-            status.values.append(
-                KeyValue(key='last_query_time', value=query_time_iso)
-            )
+        poll_monotonic = time.monotonic()
+        new_cache = CachedStatus(
+            system_board=system_board,
+            cellular_signal=cellular_signal,
+            cellular_supported=cellular_supported,
+            mwan3=mwan3,
+            mwan3_supported=mwan3_supported,
+            network_interfaces=network_interfaces,
+            poll_monotonic=poll_monotonic,
+            poll_wall_iso=poll_wall_iso,
+            error_message=error_message,
+        )
         with self._cache_lock:
-            self._cached_msg = msg
-            self._last_poll_time = self.get_clock().now()
+            self._cache = new_cache
 
-    def _publish_callback(self):
-        with self._cache_lock:
-            msg = self._cached_msg
-            last_poll = self._last_poll_time
-        if msg is None:
-            return
-
-        now = self.get_clock().now()
-        msg.header.stamp = now.to_msg()
-
-        # Downgrade levels to STALE if the cached data is older than
-        # max_data_age. Consumers that only read status.level (not the
-        # last_query_time KeyValue) need this to detect polling stalls.
-        if last_poll is not None and (now - last_poll) > self._max_data_age:
-            age_s = (now - last_poll).nanoseconds / 1e9
-            for status in msg.status:
-                status.level = DiagnosticStatus.STALE
-                status.message = f'STALE: {age_s:.1f}s since last poll'
-
-        self.diag_pub.publish(msg)
-
-    def _add_system_diagnostics(self, msg: DiagnosticArray):
-        board = self.client.get_system_board()
-        status = DiagnosticStatus()
-        status.name = f'Teltonika: {self.hardware_id}: system'
-        status.hardware_id = self.hardware_id
-        status.level = DiagnosticStatus.OK
-        status.message = board.get('model', 'unknown')
-
-        for field in ['model', 'hostname', 'kernel', 'system']:
-            if field in board:
-                status.values.append(
-                    KeyValue(key=field, value=str(board[field]))
-                )
-
-        release = board.get('release', {})
-        for field in ['distribution', 'version', 'description']:
-            if field in release:
-                status.values.append(KeyValue(
-                    key=f'release.{field}',
-                    value=str(release[field]),
-                ))
-
-        msg.status.append(status)
-
-    @staticmethod
-    def _parse_dbm(value):
-        """Parse a dBm string like '-85 dBm' to a float, or return None."""
-        if value is None:
-            return None
-        try:
-            return float(str(value).split()[0])
-        except (ValueError, IndexError):
-            return None
-
-    @staticmethod
-    def _parse_db(value):
-        """Parse a dB string like '12.5 dB' to a float, or return None."""
-        if value is None:
-            return None
-        try:
-            return float(str(value).split()[0])
-        except (ValueError, IndexError):
-            return None
-
-    @staticmethod
-    def _cellular_quality(rsrp, sinr):
-        """Map RSRP/SINR to a diagnostic level and signal bars string.
-
-        Thresholds based on 3GPP signal quality ranges for LTE:
-          Excellent: RSRP > -80   SINR > 20
-          Good:      RSRP > -90   SINR > 13
-          Fair:      RSRP > -100  SINR > 0
-          Poor:      RSRP > -110  SINR > -5
-          Very poor: below
-        """
-        bar_chars = ['▁', '▂', '▃', '▅', '█']
-        if rsrp is None:
-            return DiagnosticStatus.WARN, '?'
-        if rsrp > -80:
-            n = 5
-        elif rsrp >= -90:
-            n = 4
-        elif rsrp >= -100:
-            n = 3
-        elif rsrp >= -110:
-            n = 2
-        else:
-            n = 1
-        # SINR can downgrade by one bar
-        if sinr is not None and sinr < 0 and n > 1:
-            n -= 1
-        bars = ''.join(bar_chars[:n]) + ''.join('·' for _ in range(5 - n))
-        if n >= 4:
-            level = DiagnosticStatus.OK
-        elif n >= 2:
-            level = DiagnosticStatus.WARN
-        else:
-            level = DiagnosticStatus.ERROR
-        return level, bars
-
-    def _add_cellular_diagnostics(self, msg: DiagnosticArray):
-        try:
-            signal = self.client.get_signal()
-        except UbusClientError as e:
-            if e.code == 3:
-                # Method not found — no cellular modem
-                return
-            self.get_logger().warning(
-                f'Failed to query cellular signal: {e}'
+        if error_message is None:
+            self._reconcile_dynamic_tasks(
+                mwan3, network_interfaces, poll_monotonic,
             )
-            return
 
-        status = DiagnosticStatus()
-        status.name = f'Teltonika: {self.hardware_id}: cellular'
-        status.hardware_id = self.hardware_id
+    def _reconcile_dynamic_tasks(
+        self,
+        mwan3: dict | None,
+        network_interfaces: list[dict],
+        now_monotonic: float,
+    ):
+        """Add/remove Updater tasks to match observed mwan3 / interface membership."""
+        # mwan3 members — filter by ignored_interfaces (mwan3 names
+        # overlap with interface names).
+        observed_mwan_names: set[str] = set()
+        if mwan3 is not None:
+            for name in mwan3.get('interfaces', {}).keys():
+                if name in self._ignored_interfaces:
+                    continue
+                observed_mwan_names.add(mwan3_task_name(self._name_prefix, name))
 
-        net_mode = signal.get('net_mode', 'No service')
-        if net_mode == 'No service':
-            status.level = DiagnosticStatus.WARN
-            status.message = 'No service'
-        else:
-            rsrp = self._parse_dbm(signal.get('rsrp'))
-            sinr = self._parse_db(signal.get('sinr'))
-            level, bars = self._cellular_quality(rsrp, sinr)
-            status.level = level
-            rsrp_str = f' {rsrp:.0f}dBm' if rsrp is not None else ''
-            status.message = f'{net_mode}{rsrp_str} {bars}'
+        to_add, to_remove, new_last_seen = diff_dynamic_membership(
+            observed_mwan_names,
+            set(self._mwan3_last_seen.keys()),
+            self._mwan3_last_seen,
+            self._dynamic_task_grace_sec,
+            now_monotonic,
+        )
+        for task_name in to_add:
+            mwan_name = task_name[len(self._name_prefix) + len(': mwan3/'):]
+            self._updater.add(task_name, self._make_mwan3_task(mwan_name))
+        for task_name in to_remove:
+            self._updater.removeByName(task_name)
+        self._mwan3_last_seen = new_last_seen
 
-        for field in ['net_mode', 'rssi', 'rsrp', 'sinr', 'rsrq']:
-            if field in signal:
-                status.values.append(
-                    KeyValue(key=field, value=str(signal[field]))
-                )
+        # Network interfaces (already filtered by ignored_interfaces
+        # during _poll_callback).
+        observed_iface_names = {
+            interface_task_name(self._name_prefix, i.get('interface', 'unknown'))
+            for i in network_interfaces
+        }
+        to_add, to_remove, new_last_seen = diff_dynamic_membership(
+            observed_iface_names,
+            set(self._iface_last_seen.keys()),
+            self._iface_last_seen,
+            self._dynamic_task_grace_sec,
+            now_monotonic,
+        )
+        for task_name in to_add:
+            iface_name = task_name[len(self._name_prefix) + len(': interface/'):]
+            self._updater.add(task_name, self._make_interface_task(iface_name))
+        for task_name in to_remove:
+            self._updater.removeByName(task_name)
+        self._iface_last_seen = new_last_seen
 
-        msg.status.append(status)
 
-    def _add_mwan3_diagnostics(self, msg: DiagnosticArray):
-        try:
-            mwan = self.client.get_mwan3_status()
-        except UbusClientError as e:
-            if e.code == 3:
-                # Method not found — mwan3 not installed
-                return
-            self.get_logger().warning(
-                f'Failed to query mwan3 status: {e}'
-            )
-            return
-
-        interfaces = mwan.get('interfaces', {})
-        for name, data in interfaces.items():
-            if name in self._ignored_interfaces:
-                continue
-            status = DiagnosticStatus()
-            status.name = (
-                f'Teltonika: {self.hardware_id}: mwan3/{name}'
-            )
-            status.hardware_id = self.hardware_id
-
-            wan_status = data.get('status', 'unknown')
-            if wan_status == 'online':
-                status.level = DiagnosticStatus.OK
-                status.message = 'Online'
-            elif wan_status == 'standby':
-                # Standby is the expected steady state for a configured
-                # backup interface while the primary is up — not a warning.
-                status.level = DiagnosticStatus.OK
-                status.message = 'Standby'
-            elif wan_status == 'offline':
-                status.level = DiagnosticStatus.ERROR
-                status.message = 'Offline'
-            else:
-                status.level = DiagnosticStatus.WARN
-                status.message = wan_status
-
-            for field in ['status', 'online', 'offline', 'uptime',
-                          'score', 'lost', 'enabled', 'running', 'up']:
-                if field in data:
-                    status.values.append(
-                        KeyValue(key=field, value=str(data[field]))
-                    )
-
-            # Track IP health
-            for track in data.get('track_ip', []):
-                ip = track.get('ip', '?')
-                track_status = track.get('status', '?')
-                latency = track.get('latency', 0)
-                loss = track.get('packetloss', 0)
-                status.values.append(
-                    KeyValue(
-                        key=f'track/{ip}',
-                        value=f'{track_status} latency={latency} loss={loss}',
-                    )
-                )
-
-            msg.status.append(status)
-
-    def _add_interface_diagnostics(self, msg: DiagnosticArray):
-        try:
-            result = self.client.get_network_interfaces()
-        except UbusClientError as e:
-            if e.code == 3:
-                return
-            self.get_logger().warning(
-                f'Failed to query network interfaces: {e}'
-            )
-            return
-
-        for iface in result.get('interface', []):
-            name = iface.get('interface', 'unknown')
-            if name in self._ignored_interfaces:
-                continue
-            status = DiagnosticStatus()
-            status.name = (
-                f'Teltonika: {self.hardware_id}: interface/{name}'
-            )
-            status.hardware_id = self.hardware_id
-
-            is_up = iface.get('up', False)
-            if is_up:
-                status.level = DiagnosticStatus.OK
-                status.message = 'Up'
-            else:
-                status.level = DiagnosticStatus.WARN
-                status.message = 'Down'
-
-            for field in ['up', 'proto', 'device', 'metric',
-                          'uptime', 'l3_device']:
-                if field in iface:
-                    status.values.append(
-                        KeyValue(key=field, value=str(iface[field]))
-                    )
-
-            # IP addresses
-            for addr_info in iface.get('ipv4-address', []):
-                addr = addr_info.get('address', '')
-                mask = addr_info.get('mask', '')
-                if addr:
-                    status.values.append(
-                        KeyValue(key='ipv4', value=f'{addr}/{mask}')
-                    )
-
-            msg.status.append(status)
+def _emit(stat, level: int, message: str, kvs):
+    """Apply (level, message, kvs) to a DiagnosticStatusWrapper."""
+    stat.summary(level, message)
+    for kv in kvs:
+        stat.add(kv.key, kv.value)
+    return stat
 
 
 def main(args=None):

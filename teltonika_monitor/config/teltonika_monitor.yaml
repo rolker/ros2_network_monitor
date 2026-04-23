@@ -5,6 +5,17 @@ teltonika_monitor:
     password: ''
     port: 443
     use_ssl: true
-    poll_interval: 5.0
-    hardware_id: ''
     verify_ssl: false
+    hardware_id: ''
+    poll_interval: 5.0
+    # diagnostic_updater.Updater publish cadence.  Controls how often
+    # /diagnostics is emitted; independent of poll_interval so slow
+    # ubus calls don't starve downstream consumers.
+    update_period_sec: 1.0
+    # Cached data older than this is marked STALE by task callbacks.
+    # 0.0 = auto (3 * poll_interval).
+    stale_timeout_sec: 0.0
+    # Grace period before a missing dynamic task (mwan3 member or
+    # interface) is removed via Updater.removeByName.  Absorbs
+    # transient flaps.  0.0 = auto (2 * stale_timeout_sec).
+    dynamic_task_grace_sec: 0.0
