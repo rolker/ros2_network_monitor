@@ -81,10 +81,15 @@ No dynamic membership — targets are a static parameter at launch.
 | `MikroTik: <hwid>: wireless/<name>` | Per-wireless-registration dynamic set — see §3 |
 
 Note the **new** `connection` task. It replaces the bug-creating
-"rename-on-error" pattern. Existing annunciator configs that already
-match `MikroTik: <hwid>` as a prefix continue to match both it and the
-new `: connection` suffix; configs that expect the bare `MikroTik: <hwid>`
-name should be migrated to `: connection` (documented in PR description).
+"rename-on-error" pattern. A workspace grep (2026-04-23) across
+`layers/main/**/*.{yaml,yml}` confirmed **no downstream config exact-matches
+the bare `MikroTik: <hwid>` / `Teltonika: <hwid>` summary name** —
+consumers use either `startswith` prefix matching (the aggregator at
+`bizzyboat_project11/config/diagnostics.yaml`) or task-suffixed names
+like `: cellular` / `: wireless/` (the panel at
+`bizzyboat_project11/config/bizzyboat_annunciator.yaml`). Introducing
+`: connection` and dropping the bare-summary error path is strictly
+additive from the consumer's perspective.
 
 **teltonika_monitor**:
 
@@ -125,11 +130,11 @@ is static.
 `starlink_stats.diagnostics_logic`)
 
 For each monitor, pull the "cache snapshot → DiagnosticStatus fields"
-synthesis into a pure module (`network_tools/network_tools/ping_logic.py`,
-`mikrotik_monitor/mikrotik_monitor/mikrotik_logic.py`, etc.) that takes
-primitives (dicts, ints, `now_monotonic`) and returns
-`(level, message, kvs)`. The node keeps ROS integration; the logic module
-gets comprehensive unit tests covering:
+synthesis into a pure module named **`diagnostics_logic.py`** (same
+name in each package, matching Starlink's convention for fleet-wide
+consistency). The module takes primitives (dicts, ints, `now_monotonic`)
+and returns `(level, message, kvs)`. The node keeps ROS integration;
+the logic module gets comprehensive unit tests covering:
 
 - OK / WARN / ERROR thresholds
 - STALE emission when cache is None or too old
@@ -144,17 +149,25 @@ Keep it: `_apply_common_kv` reads `cache.poll_wall_iso` and appends
 
 ### 6. Align timing parameters with Starlink
 
+Two renames, driven by the Updater migration:
+
 | Old param (all three nodes) | New param | Default | Semantics |
 |---|---|---|---|
 | `max_data_age_s` | `stale_timeout_sec` | 5.0 | Cache-age threshold above which tasks emit STALE |
 | `publish_interval` | `update_period_sec` | 1.0 | `diagnostic_updater.Updater` publish cadence |
-| `poll_interval` | `poll_interval_sec` (unchanged meaning) | existing per-monitor default | How often to poll the remote device; renamed only for `_sec` suffix consistency |
 
-**No deprecated-alias path.** A workspace grep confirmed no launch files
-or YAML configs anywhere in the workspace pass `max_data_age_s` or
-`publish_interval` externally — every reference is inside the three
-monitor nodes' own `declare_parameter` calls. Rename cleanly and
-document the rename in the PR body.
+**`poll_interval` stays as-is.** An earlier draft proposed renaming it
+to `poll_interval_sec` for `_sec`-suffix consistency, but (a) Starlink
+uses `poll_period_sec` anyway so the consistency argument doesn't hold,
+and (b) `poll_interval` is set externally in three in-repo config YAMLs
+(`ping_targets.yaml`, `test_ping_targets.yaml`, `teltonika_monitor.yaml`)
+— renaming it cascades into config churn for no behavioral benefit.
+
+**No deprecated-alias path for the two renames.** A workspace grep
+confirmed no launch files or YAML configs anywhere in the workspace
+pass `max_data_age_s` or `publish_interval` externally — every reference
+is inside the three monitor nodes' own `declare_parameter` calls.
+Rename cleanly and document the rename in the PR body.
 
 ### 7. Consider `rqt_operator_tools#14` incidentally
 
@@ -170,18 +183,48 @@ on a separate issue.
 
 ## Files to Change
 
+### Nodes + pure-logic modules + tests
+
 | File | Change |
 |---|---|
 | `network_tools/network_tools/ping_monitor_node.py` | Replace `poll_callback`/`_publish_callback` with Updater pattern. Drop `_cache_lock` manual publish scaffolding. |
-| `network_tools/network_tools/ping_logic.py` | **New** — pure level/message synthesis for ping samples. |
+| `network_tools/network_tools/diagnostics_logic.py` | **New** — pure level/message synthesis for ping samples. |
 | `mikrotik_monitor/mikrotik_monitor/mikrotik_monitor_node.py` | Replace with Updater pattern; add `: connection` task; dynamic interface/wireless membership management. Delete the name-dropping error path. |
-| `mikrotik_monitor/mikrotik_monitor/mikrotik_logic.py` | **New** — pure synthesis helpers. |
+| `mikrotik_monitor/mikrotik_monitor/diagnostics_logic.py` | **New** — pure synthesis helpers. |
 | `teltonika_monitor/teltonika_monitor/teltonika_monitor_node.py` | Same pattern as Mikrotik; add `: connection` task; dynamic interface/mwan3 membership. |
-| `teltonika_monitor/teltonika_monitor/teltonika_logic.py` | **New** — pure synthesis helpers. |
-| `network_tools/test/test_ping_logic.py` | **New** — unit tests for ping logic. |
-| `mikrotik_monitor/test/test_mikrotik_logic.py` | **New** — unit tests including schema-drift regression. |
-| `teltonika_monitor/test/test_teltonika_logic.py` | **New** — unit tests including schema-drift regression. |
-| Each package's `package.xml` | Add `<depend>diagnostic_updater</depend>`. |
+| `teltonika_monitor/teltonika_monitor/diagnostics_logic.py` | **New** — pure synthesis helpers. |
+| `network_tools/test/test_diagnostics_logic.py` | **New** — unit tests for ping logic. |
+| `mikrotik_monitor/test/test_diagnostics_logic.py` | **New** — unit tests including schema-drift regression. |
+| `teltonika_monitor/test/test_diagnostics_logic.py` | **New** — unit tests including schema-drift regression. |
+
+### Packaging
+
+| File | Change |
+|---|---|
+| `network_tools/package.xml` | Add `<depend>diagnostic_updater</depend>`. |
+| `mikrotik_monitor/package.xml` | Add `<depend>diagnostic_updater</depend>`. |
+| `teltonika_monitor/package.xml` | Add `<depend>diagnostic_updater</depend>`. |
+
+### Configs (in-repo, must follow the param renames)
+
+| File | Change |
+|---|---|
+| `network_tools/config/ping_targets.yaml` | Verify — currently sets `poll_interval` (unchanged), no renamed params. Likely no edit. |
+| `network_tools/config/test_ping_targets.yaml` | Verify — currently sets `poll_interval`, `hardware_id` (both unchanged). Likely no edit. |
+| `teltonika_monitor/config/teltonika_monitor.yaml` | Add `stale_timeout_sec`, `update_period_sec` with explicit defaults so field deployments don't rely on node-side defaults. |
+
+### Launch files (verify unchanged)
+
+| File | Change |
+|---|---|
+| `network_tools/launch/ping_monitor.launch.py` | Verify — does not currently set renamed params. Likely no edit. |
+| `mikrotik_monitor/launch/mikrotik_monitor.launch.py` | Verify — does not currently set renamed params. Likely no edit. |
+| `teltonika_monitor/launch/teltonika_monitor.launch.py` | Verify — does not currently set renamed params. Likely no edit. |
+
+### Docs
+
+| File | Change |
+|---|---|
 | `README.md` | Short note: nodes use `diagnostic_updater.Updater`; `: connection` task now surfaces reachability instead of a summary-named status. |
 
 ## Principles Self-Check
@@ -208,7 +251,7 @@ on a separate issue.
 
 | If we change... | Also update... | Included in plan? |
 |---|---|---|
-| Diagnostic task names (`MikroTik: <hwid>` → `: connection`) | Any annunciator config that exact-matched the old summary name | **PR description** lists the name change and notes config-side migration. Separate PRs on consumer repos (if any) will follow. |
+| Diagnostic task names (`MikroTik: <hwid>` → `: connection`) | Any annunciator config that exact-matched the old summary name | Workspace grep (2026-04-23) confirmed **no such configs exist** anywhere in `layers/main/`. Consumers use `startswith` or per-task-suffix matching. Strictly additive change; no consumer migration needed. |
 | Parameter names (`max_data_age_s` → `stale_timeout_sec`; `publish_interval` → `update_period_sec`) | Any launch file or YAML config passing the old names | Workspace grep confirmed no external callers. Rename cleanly; document in PR body. |
 | `package.xml` deps (add `diagnostic_updater`) | `rosdep` database on deployment machines (pre-existing dep — already installed for Starlink) | No separate deploy step needed. |
 | Extract pure logic into `*_logic.py` modules | Imports in any external code using internal monitor modules | None known — modules are currently all internal. |
@@ -222,9 +265,12 @@ on a separate issue.
    `declare_parameter` calls. No alias path needed.
 2. **Dynamic-membership grace period.** How many missed polls before
    `removeByName` is called on a disappeared interface? Proposal above
-   says `stale_timeout_sec * 2`. Reasonable? A field observation of how
-   often interfaces transiently flap would inform this; for now default
-   to 2× and let it be tunable via a `dynamic_task_grace_sec` param.
+   says `stale_timeout_sec * 2`. Reasonable without field data, but the
+   first field session with the new nodes should explicitly observe
+   transient-flap frequency (e.g., Teltonika interfaces cycling during
+   mwan3 handoffs) and tune the default. Tunable meanwhile via a
+   `dynamic_task_grace_sec` param. **Follow-up to open as a field
+   observation task once the PR merges.**
 3. **One PR or three?** Leaning "one PR, three commits" — the helper
    extraction is shared enough that splitting three ways duplicates
    review. But if Claude Code loses signal on PR size during review,
