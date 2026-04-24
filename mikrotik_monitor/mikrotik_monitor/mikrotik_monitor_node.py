@@ -1,16 +1,45 @@
-"""ROS 2 node that polls a MikroTik device and publishes diagnostics."""
+# Copyright 2024 Roland Arsenault
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file or at
+# https://developers.google.com/open-source/licenses/bsd
 
-import threading
+"""
+ROS 2 node that polls a MikroTik device and publishes diagnostics.
+
+Uses ``diagnostic_updater.Updater`` so tasks publish at a steady cadence
+regardless of how long the RouterOS REST calls take.  Poll callback only
+updates a ``CachedStatus`` snapshot; per-task callbacks render
+``DiagnosticStatus`` from the cache via
+:mod:`mikrotik_monitor.diagnostics_logic`.
+
+Two fixed tasks always exist (``: connection`` and ``: system``).
+Per-interface and per-wireless-registration tasks are added and removed
+dynamically via ``Updater.add`` / ``Updater.removeByName`` as the
+observed membership set changes.  A grace period prevents churn on
+transient flaps.
+"""
+
 from datetime import datetime, timezone
+import threading
+import time
 
+import diagnostic_updater
+from mikrotik_monitor.diagnostics_logic import (
+    CachedStatus,
+    diff_dynamic_membership,
+    interface_task_name,
+    synthesize_connection_status,
+    synthesize_interface_status,
+    synthesize_system_status,
+    synthesize_wireless_status,
+    wireless_task_name,
+)
+from mikrotik_monitor.routeros_client import RouterOSClient, RouterOSClientError
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
-
-from mikrotik_monitor.routeros_client import RouterOSClient, RouterOSClientError
 
 
 class MikroTikMonitorNode(Node):
@@ -18,15 +47,15 @@ class MikroTikMonitorNode(Node):
     def __init__(self):
         super().__init__('mikrotik_monitor')
 
-        # Parameters
         self.declare_parameter('host', '')
         self.declare_parameter('username', 'admin')
         self.declare_parameter('password', '')
         self.declare_parameter('port', 80)
         self.declare_parameter('use_ssl', False)
         self.declare_parameter('poll_interval', 5.0)
-        self.declare_parameter('publish_interval', 1.0)
-        self.declare_parameter('max_data_age_s', 0.0)
+        self.declare_parameter('update_period_sec', 1.0)
+        self.declare_parameter('stale_timeout_sec', 0.0)
+        self.declare_parameter('dynamic_task_grace_sec', 0.0)
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
         self.declare_parameter('ignored_interfaces', [])
@@ -51,8 +80,8 @@ class MikroTikMonitorNode(Node):
         poll_interval = self.get_parameter(
             'poll_interval'
         ).get_parameter_value().double_value
-        publish_interval = self.get_parameter(
-            'publish_interval'
+        update_period_sec = self.get_parameter(
+            'update_period_sec'
         ).get_parameter_value().double_value
         self.hardware_id = self.get_parameter(
             'hardware_id'
@@ -60,8 +89,6 @@ class MikroTikMonitorNode(Node):
         verify_ssl = self.get_parameter(
             'verify_ssl'
         ).get_parameter_value().bool_value
-        # Denylist of interface names whose diagnostics should not be
-        # published (e.g. unused ports that are intentionally down).
         self._ignored_interfaces = set(
             self.get_parameter(
                 'ignored_interfaces'
@@ -77,280 +104,307 @@ class MikroTikMonitorNode(Node):
             verify_ssl=verify_ssl,
         )
 
-        # Use host as hardware_id if not specified
         if not self.hardware_id:
             self.hardware_id = host
 
-        self.diag_pub = self.create_publisher(
-            DiagnosticArray, '/diagnostics', 10
+        # stale_timeout_sec = 0 → auto (3 × poll_interval).
+        stale_timeout_sec = self.get_parameter(
+            'stale_timeout_sec'
+        ).get_parameter_value().double_value
+        if stale_timeout_sec <= 0.0:
+            stale_timeout_sec = 3.0 * poll_interval
+        self._stale_timeout_sec = stale_timeout_sec
+
+        # dynamic_task_grace_sec = 0 → auto (2 × stale_timeout_sec).
+        # Interfaces/wireless registrations missing from a single poll
+        # are given this long to reappear before Updater.removeByName is
+        # called on them.  Prevents churn on transient flaps.  Field-
+        # tunable; the first long deployment with the new nodes should
+        # observe flap frequency and inform a better default.
+        grace_sec = self.get_parameter(
+            'dynamic_task_grace_sec'
+        ).get_parameter_value().double_value
+        if grace_sec <= 0.0:
+            grace_sec = 2.0 * stale_timeout_sec
+        self._dynamic_task_grace_sec = grace_sec
+
+        self._name_prefix = f'MikroTik: {self.hardware_id}'
+
+        # Cache + dynamic-membership bookkeeping.  All access guarded by
+        # _cache_lock so task callbacks on the rclpy thread only see
+        # consistent snapshots.
+        self._cache_lock = threading.Lock()
+        self._cache = CachedStatus()
+        # Registered dynamic-task names → last monotonic time observed.
+        # Fed to diff_dynamic_membership to drive grace-period removal.
+        self._iface_last_seen: dict[str, float] = {}
+        self._wireless_last_seen: dict[str, float] = {}
+
+        # diagnostic_updater.Updater publishes all registered tasks at
+        # update_period_sec regardless of poll timing.
+        self._updater = diagnostic_updater.Updater(
+            self, period=update_period_sec,
+        )
+        self._updater.setHardwareID(self.hardware_id)
+
+        # Fixed tasks — always registered.
+        self._updater.add(
+            f'{self._name_prefix}: connection',
+            self._task_connection,
+        )
+        self._updater.add(
+            f'{self._name_prefix}: system',
+            self._task_system,
         )
 
-        # Cache of the most recent poll result (success or failure);
-        # republished at publish_interval to avoid false STALE in
-        # downstream consumers. On client error the cached message
-        # carries the ERROR status so subscribers see the device is
-        # down persistently between retries.
-        self._cached_msg: DiagnosticArray | None = None
-        self._last_poll_time = None
-        self._cache_lock = threading.Lock()
-
-        # Stale threshold: if no successful poll within max_data_age_s,
-        # republished statuses are downgraded to STALE so consumers that
-        # only read DiagnosticStatus.level (not the last_query_time
-        # KeyValue) still see real polling stalls. 0 = auto, 3*poll.
-        max_data_age_s = self.get_parameter(
-            'max_data_age_s'
-        ).get_parameter_value().double_value
-        if max_data_age_s <= 0.0:
-            max_data_age_s = 3.0 * poll_interval
-        self._max_data_age = Duration(seconds=max_data_age_s)
-
-        # Separate callback groups so the publish timer can run while a
-        # slow poll is in progress — required by the MultiThreadedExecutor
-        # in main(). RouterOSClient HTTP requests can stall for tens of
-        # seconds when the device is unreachable; without the split the
-        # publish_interval guarantee would be broken exactly when
-        # downstream consumers most need fresh data.
+        # Separate callback groups: the Updater publish timer must run
+        # while a slow poll is in progress.  RouterOSClient HTTP
+        # requests can stall for tens of seconds when the device is
+        # unreachable.
         self.poll_timer = self.create_timer(
             poll_interval,
-            self.poll_callback,
+            self._poll_callback,
             callback_group=MutuallyExclusiveCallbackGroup(),
         )
-        self.publish_timer = self.create_timer(
-            publish_interval,
-            self._publish_callback,
-            callback_group=MutuallyExclusiveCallbackGroup(),
-        )
+
         self.get_logger().info(
             f'Monitoring MikroTik device at {host}:{port} '
             f'poll every {poll_interval}s, '
-            f'publish every {publish_interval}s'
+            f'publish every {update_period_sec}s, '
+            f'stale_timeout={self._stale_timeout_sec}s, '
+            f'dynamic_task_grace={self._dynamic_task_grace_sec}s'
         )
 
-    def poll_callback(self):
-        msg = DiagnosticArray()
-        query_time_iso = datetime.now(timezone.utc).isoformat()
+    # --- Task callbacks ---
+
+    def _task_connection(self, stat):
+        level, message, kvs = synthesize_connection_status(
+            self._cache_snapshot(),
+            self._stale_timeout_sec,
+            time.monotonic(),
+        )
+        return _emit(stat, level, message, kvs)
+
+    def _task_system(self, stat):
+        level, message, kvs = synthesize_system_status(
+            self._cache_snapshot(),
+            self._stale_timeout_sec,
+            time.monotonic(),
+        )
+        return _emit(stat, level, message, kvs)
+
+    def _make_interface_task(self, iface_name: str):
+        def _task(stat):
+            level, message, kvs = synthesize_interface_status(
+                self._cache_snapshot(),
+                iface_name,
+                self._stale_timeout_sec,
+                time.monotonic(),
+            )
+            return _emit(stat, level, message, kvs)
+        return _task
+
+    def _make_wireless_task(self, iface: str, mac: str):
+        def _task(stat):
+            level, message, kvs = synthesize_wireless_status(
+                self._cache_snapshot(),
+                iface,
+                mac,
+                self._stale_timeout_sec,
+                time.monotonic(),
+            )
+            return _emit(stat, level, message, kvs)
+        return _task
+
+    def _cache_snapshot(self) -> CachedStatus:
+        with self._cache_lock:
+            return self._cache
+
+    # --- Polling ---
+
+    def _poll_callback(self):
+        """Fetch the latest device state; update cache and dynamic tasks."""
+        poll_wall_iso = datetime.now(timezone.utc).isoformat()
+        error_message = None
+        system_resource = None
+        system_health = None
+        interfaces: list[dict] | None = None   # None → inherit prior
+        wireless: list[dict] | None = None     # None → inherit prior
 
         try:
-            self._add_system_diagnostics(msg)
-            self._add_interface_diagnostics(msg)
-            self._add_wireless_diagnostics(msg)
+            system_resource = self.client.get_system_resource()
+            # Health is optional — not all devices support it.
+            try:
+                system_health = self.client.get_system_health()
+            except RouterOSClientError:
+                system_health = None
+            # Wrap get_interfaces individually for symmetry with the
+            # other sub-queries — a partial failure here should not
+            # discard the already-successful system_resource.
+            try:
+                raw_interfaces = self.client.get_interfaces()
+                interfaces = [
+                    i for i in raw_interfaces
+                    if i.get('name', 'unknown') not in self._ignored_interfaces
+                ]
+            except RouterOSClientError as e:
+                self.get_logger().warning(
+                    f'Failed to query interfaces: {e}'
+                )
+                interfaces = None  # sentinel: "don't know"; preserve prior
+            try:
+                raw_wireless = self.client.get_wireless_registrations()
+                wireless = [
+                    w for w in raw_wireless
+                    if w.get('interface') not in self._ignored_interfaces
+                ]
+            except RouterOSClientError as e:
+                if e.http_code in (400, 404):
+                    # No wireless interfaces on this device — not an error.
+                    wireless = []
+                else:
+                    self.get_logger().warning(
+                        f'Failed to query wireless registrations: {e}'
+                    )
+                    wireless = None  # sentinel: preserve prior
         except RouterOSClientError as e:
-            # Publish error status so diagnostics shows the device is down
-            status = DiagnosticStatus()
-            status.level = DiagnosticStatus.ERROR
-            status.name = f'MikroTik: {self.hardware_id}'
-            status.hardware_id = self.hardware_id
-            status.message = f'Connection error: {e}'
-            msg.status.append(status)
+            error_message = f'Connection error: {e}'
             self.get_logger().warning(f'Failed to poll device: {e}')
 
-        # Stamp every status with the actual query time so observers can
-        # compute true data age across republishes.
-        for status in msg.status:
-            status.values.append(
-                KeyValue(key='last_query_time', value=query_time_iso)
-            )
+        reconcile_args: tuple | None = None
         with self._cache_lock:
-            self._cached_msg = msg
-            self._last_poll_time = self.get_clock().now()
-
-    def _publish_callback(self):
-        with self._cache_lock:
-            msg = self._cached_msg
-            last_poll = self._last_poll_time
-        if msg is None:
-            return
-
-        now = self.get_clock().now()
-        msg.header.stamp = now.to_msg()
-
-        # Downgrade levels to STALE if the cached data is older than
-        # max_data_age. Consumers that only read status.level (not the
-        # last_query_time KeyValue) need this to detect polling stalls.
-        if last_poll is not None and (now - last_poll) > self._max_data_age:
-            age_s = (now - last_poll).nanoseconds / 1e9
-            for status in msg.status:
-                status.level = DiagnosticStatus.STALE
-                status.message = f'STALE: {age_s:.1f}s since last poll'
-
-        self.diag_pub.publish(msg)
-
-    def _add_system_diagnostics(self, msg: DiagnosticArray):
-        resource = self.client.get_system_resource()
-        status = DiagnosticStatus()
-        status.name = f'MikroTik: {self.hardware_id}: system'
-        status.hardware_id = self.hardware_id
-        status.level = DiagnosticStatus.OK
-        status.message = resource.get('board-name', 'unknown')
-
-        fields = [
-            'board-name', 'version', 'uptime',
-            'cpu-load', 'cpu-count', 'cpu-frequency',
-            'free-memory', 'total-memory',
-            'free-hdd-space', 'total-hdd-space',
-        ]
-        for field in fields:
-            if field in resource:
-                status.values.append(
-                    KeyValue(key=field, value=str(resource[field]))
+            prev = self._cache
+            if error_message is None:
+                # Successful outer poll.  Use freshly-fetched fields,
+                # substituting the previous cache value for any sub-query
+                # that returned None (sentinel from inner except).
+                # poll_monotonic advances to "now" because we have fresh
+                # confirmation of device reachability.
+                new_cache = CachedStatus(
+                    system_resource=system_resource,
+                    system_health=(
+                        system_health if system_health is not None
+                        else prev.system_health
+                    ),
+                    interfaces=(
+                        interfaces if interfaces is not None
+                        else prev.interfaces
+                    ),
+                    wireless=(
+                        wireless if wireless is not None
+                        else prev.wireless
+                    ),
+                    poll_monotonic=time.monotonic(),
+                    poll_wall_iso=poll_wall_iso,
+                    error_message=None,
                 )
-
-        # Add health data (temperature, voltage) if available
-        try:
-            health = self.client.get_system_health()
-            if isinstance(health, list):
-                for entry in health:
-                    name = entry.get('name', '')
-                    value = entry.get('value', '')
-                    if name and value:
-                        status.values.append(
-                            KeyValue(key=name, value=str(value))
-                        )
-            elif isinstance(health, dict):
-                for key, value in health.items():
-                    if key != '.id':
-                        status.values.append(
-                            KeyValue(key=key, value=str(value))
-                        )
-        except RouterOSClientError:
-            pass  # Not all devices support /system/health
-
-        msg.status.append(status)
-
-    def _add_interface_diagnostics(self, msg: DiagnosticArray):
-        interfaces = self.client.get_interfaces()
-        for iface in interfaces:
-            iface_name = iface.get('name', 'unknown')
-            if iface_name in self._ignored_interfaces:
-                continue
-            status = DiagnosticStatus()
-            status.name = (
-                f'MikroTik: {self.hardware_id}: '
-                f'interface/{iface_name}'
-            )
-            status.hardware_id = self.hardware_id
-
-            running = str(iface.get('running', 'false')).lower() == 'true'
-            disabled = str(iface.get('disabled', 'false')).lower() == 'true'
-
-            if disabled:
-                status.level = DiagnosticStatus.WARN
-                status.message = 'Disabled'
-            elif not running:
-                status.level = DiagnosticStatus.WARN
-                status.message = 'Not running'
+                # Capture what _reconcile_dynamic_tasks needs BEFORE
+                # releasing the lock so the reconcile call sees a
+                # consistent snapshot even if another poll is already
+                # in flight on another thread.  Only captured on the
+                # success path — failure skips reconciliation entirely.
+                reconcile_args = (
+                    new_cache.interfaces,
+                    new_cache.wireless,
+                    new_cache.poll_monotonic,
+                )
             else:
-                status.level = DiagnosticStatus.OK
-                status.message = 'Running'
+                # Outer connection failure.  Preserve previous cache
+                # fields so per-task callbacks keep rendering last-known
+                # data until the cache ages past stale_timeout_sec.
+                # poll_monotonic stays at the previous successful value
+                # (drives STALE emission).  poll_wall_iso updates so the
+                # last_query_time KeyValue reflects the most recent poll
+                # *attempt*.
+                new_cache = CachedStatus(
+                    system_resource=prev.system_resource,
+                    system_health=prev.system_health,
+                    interfaces=prev.interfaces,
+                    wireless=prev.wireless,
+                    poll_monotonic=prev.poll_monotonic,
+                    poll_wall_iso=poll_wall_iso,
+                    error_message=error_message,
+                )
+            self._cache = new_cache
 
-            # Report available fields
-            fields = [
-                'type', 'mtu', 'running', 'disabled',
-                'tx-byte', 'rx-byte',
-                'tx-packet', 'rx-packet',
-                'tx-error', 'rx-error',
-                'tx-drop', 'rx-drop',
-                'link-downs',
-            ]
-            for field in fields:
-                if field in iface:
-                    status.values.append(
-                        KeyValue(key=field, value=str(iface[field]))
-                    )
+        # Dynamic-membership reconciliation only runs on a successful
+        # outer poll — on failure we don't know the current membership,
+        # so leave the registered tasks alone and let them emit STALE
+        # via their own callbacks once the preserved cache ages out.
+        if reconcile_args is not None:
+            self._reconcile_dynamic_tasks(*reconcile_args)
 
-            msg.status.append(status)
+    def _reconcile_dynamic_tasks(
+        self,
+        interfaces: list[dict],
+        wireless: list[dict],
+        now_monotonic: float,
+    ):
+        """Add/remove Updater tasks to match the observed membership.
 
-    def _add_wireless_diagnostics(self, msg: DiagnosticArray):
-        try:
-            registrations = self.client.get_wireless_registrations()
-        except RouterOSClientError as e:
-            if e.http_code in (400, 404):
-                # Device doesn't have wireless interfaces — not an error
-                return
-            self.get_logger().warning(
-                f'Failed to query wireless registrations: {e}'
-            )
-            return
-
-        for reg in registrations:
-            mac = reg.get('mac-address', 'unknown')
-            interface = reg.get('interface', 'unknown')
-            if interface in self._ignored_interfaces:
-                continue
-            status = DiagnosticStatus()
-            status.name = (
-                f'MikroTik: {self.hardware_id}: '
-                f'wireless/{interface}/{mac}'
-            )
-            status.hardware_id = self.hardware_id
-
-            snr = self._parse_snr(reg.get('signal-to-noise'))
-            level, bars = self._wireless_quality(snr)
-            status.level = level
-            snr_str = f' SNR {snr:.0f}dB' if snr is not None else ''
-            status.message = f'Associated{snr_str} {bars}'
-
-            fields = [
-                'interface', 'mac-address',
-                'signal-strength', 'signal-to-noise',
-                'noise-floor',
-                'tx-rate', 'rx-rate',
-                'tx-ccq', 'rx-ccq',
-                'uptime',
-                'bytes', 'packets',
-                'frames',
-            ]
-            for field in fields:
-                if field in reg:
-                    status.values.append(
-                        KeyValue(key=field, value=str(reg[field]))
-                    )
-
-            msg.status.append(status)
-
-    @staticmethod
-    def _parse_snr(value):
-        """Parse an SNR string like '22@HT40' or '22 dB' to float."""
-        if value is None:
-            return None
-        try:
-            return float(str(value).split('@')[0].split()[0])
-        except (ValueError, IndexError):
-            return None
-
-    @staticmethod
-    def _wireless_quality(snr):
-        """Map SNR to a diagnostic level and signal bars string.
-
-        Thresholds for 5 GHz point-to-point link:
-          Excellent: SNR > 30
-          Good:      SNR > 20
-          Fair:      SNR > 15
-          Poor:      SNR > 10
-          Very poor: below
+        Called from ``_poll_callback`` on the poll timer's callback
+        group, while the Updater's internal periodic publish timer
+        runs in the node's default group.  Concurrent execution is
+        safe: ``diagnostic_updater.Updater`` serializes ``add``,
+        ``removeByName``, and ``update`` (task iteration) under a
+        shared ``threading.Lock`` — see
+        ``diagnostic_updater/_diagnostic_updater.py:172,199,213,274``
+        in Jazzy.  Lock ordering in this node is clean: the cache
+        lock is released before the Updater's internal lock is
+        acquired, so no deadlock is possible.
         """
-        bar_chars = ['▁', '▂', '▃', '▅', '█']
-        if snr is None:
-            return DiagnosticStatus.WARN, '?'
-        if snr > 30:
-            n = 5
-        elif snr >= 20:
-            n = 4
-        elif snr >= 15:
-            n = 3
-        elif snr >= 10:
-            n = 2
-        else:
-            n = 1
-        bars = ''.join(bar_chars[:n]) + ''.join('·' for _ in range(5 - n))
-        if n >= 4:
-            level = DiagnosticStatus.OK
-        elif n >= 2:
-            level = DiagnosticStatus.WARN
-        else:
-            level = DiagnosticStatus.ERROR
-        return level, bars
+        observed_iface_names = {
+            interface_task_name(self._name_prefix, i.get('name', 'unknown'))
+            for i in interfaces
+        }
+        observed_wireless_names = {
+            wireless_task_name(
+                self._name_prefix,
+                w.get('interface', 'unknown'),
+                w.get('mac-address', 'unknown'),
+            )
+            for w in wireless
+        }
+
+        # Interfaces
+        to_add, to_remove, new_last_seen = diff_dynamic_membership(
+            observed_iface_names,
+            set(self._iface_last_seen.keys()),
+            self._iface_last_seen,
+            self._dynamic_task_grace_sec,
+            now_monotonic,
+        )
+        for task_name in to_add:
+            iface_name = task_name[len(self._name_prefix) + len(': interface/'):]
+            self._updater.add(task_name, self._make_interface_task(iface_name))
+        for task_name in to_remove:
+            self._updater.removeByName(task_name)
+        self._iface_last_seen = new_last_seen
+
+        # Wireless
+        to_add, to_remove, new_last_seen = diff_dynamic_membership(
+            observed_wireless_names,
+            set(self._wireless_last_seen.keys()),
+            self._wireless_last_seen,
+            self._dynamic_task_grace_sec,
+            now_monotonic,
+        )
+        for task_name in to_add:
+            # Task name is "<prefix>: wireless/<iface>/<mac>"
+            suffix = task_name[len(self._name_prefix) + len(': wireless/'):]
+            iface, _, mac = suffix.partition('/')
+            self._updater.add(task_name, self._make_wireless_task(iface, mac))
+        for task_name in to_remove:
+            self._updater.removeByName(task_name)
+        self._wireless_last_seen = new_last_seen
+
+
+def _emit(stat, level: int, message: str, kvs):
+    """Apply (level, message, kvs) to a DiagnosticStatusWrapper."""
+    stat.summary(level, message)
+    for kv in kvs:
+        stat.add(kv.key, kv.value)
+    return stat
 
 
 def main(args=None):

@@ -4,17 +4,30 @@
 # license that can be found in the LICENSE file or at
 # https://developers.google.com/open-source/licenses/bsd
 
-"""ROS 2 node that pings a list of targets and publishes diagnostics."""
+"""
+ROS 2 node that pings a list of targets and publishes diagnostics.
 
+Uses ``diagnostic_updater.Updater`` so each ping target gets a fixed-name
+task that publishes at a steady cadence regardless of how long the
+subprocess ping calls take.  Poll callback only updates per-target
+``PingSample`` entries in a cache; task callbacks read the cache and
+synthesize ``DiagnosticStatus`` via :mod:`network_tools.diagnostics_logic`.
+"""
+
+from datetime import datetime, timezone
 import math
 import subprocess
 import threading
-from datetime import datetime, timezone
+import time
+from typing import Dict
 
-from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+import diagnostic_updater
+from network_tools.diagnostics_logic import (
+    PingSample,
+    synthesize_ping_status,
+)
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
@@ -26,8 +39,8 @@ class PingMonitorNode(Node):
 
         self.declare_parameter('targets', rclpy.Parameter.Type.STRING_ARRAY)
         self.declare_parameter('poll_interval', 10.0)
-        self.declare_parameter('publish_interval', 1.0)
-        self.declare_parameter('max_data_age_s', 0.0)
+        self.declare_parameter('update_period_sec', 1.0)
+        self.declare_parameter('stale_timeout_sec', 0.0)
         self.declare_parameter('ping_count', 3)
         self.declare_parameter('ping_timeout', 5.0)
         self.declare_parameter('hardware_id', '')
@@ -40,7 +53,7 @@ class PingMonitorNode(Node):
             )
             raise SystemExit(1)
 
-        self.targets = []
+        self.targets: list[tuple[str, str]] = []
         for entry in raw_targets:
             if ':' not in entry:
                 self.get_logger().error(
@@ -58,62 +71,61 @@ class PingMonitorNode(Node):
                 raise SystemExit(1)
             self.targets.append((name, address))
 
-        self.poll_interval = self.get_parameter(
-            'poll_interval'
-        ).value
-        publish_interval = self.get_parameter(
-            'publish_interval'
-        ).value
-        self.ping_count = self.get_parameter(
-            'ping_count'
-        ).value
-        self.ping_timeout = self.get_parameter(
-            'ping_timeout'
-        ).value
+        self.poll_interval = self.get_parameter('poll_interval').value
+        update_period_sec = self.get_parameter('update_period_sec').value
+        self.ping_count = self.get_parameter('ping_count').value
+        self.ping_timeout = self.get_parameter('ping_timeout').value
         self.hardware_id = self.get_parameter('hardware_id').value
+
+        # stale_timeout_sec = 0 means "auto": cached sample is considered
+        # stale after 3 poll_intervals.  The 3× factor (vs. 2× for
+        # mikrotik/teltonika) reflects that a sequential ping pass over
+        # many targets with generous ping_timeout can legitimately take
+        # ~2 poll_intervals to complete; tripling gives one missed poll
+        # of headroom before the task flips to STALE.  Explicit values
+        # override for field tuning.
+        stale_timeout_sec = self.get_parameter('stale_timeout_sec').value
+        if stale_timeout_sec <= 0.0:
+            stale_timeout_sec = 3.0 * self.poll_interval
+        self._stale_timeout_sec = stale_timeout_sec
+
         self._name_prefix = (
             f'Ping: {self.hardware_id}' if self.hardware_id else 'Ping'
         )
 
-        self.diag_pub = self.create_publisher(
-            DiagnosticArray, '/diagnostics', 10
-        )
-
-        # Cache of the most recent poll result (success or failure).
-        # Republished at publish_interval so downstream consumers
-        # (rqt_runtime_monitor's 5 s stale window, aggregator analyzers,
-        # annunciator stale timeouts) don't see false STALE between
-        # polls. Unreachable targets surface as ERROR statuses that get
-        # cached and persistently republished until the next poll.
-        self._cached_msg: DiagnosticArray | None = None
-        self._last_poll_time = None
+        # Per-target cache.  Replaced whole-dataclass under the lock so
+        # task callbacks on the rclpy thread never see torn values.
+        # Seeded with a placeholder so Updater tasks added at __init__
+        # have something to read before the first poll completes.
+        # ``ping_count`` is seeded to the configured value so the
+        # ``ping_count`` KeyValue is consistent from the first STALE
+        # publish rather than flipping from 0 once the first poll lands.
         self._cache_lock = threading.Lock()
+        self._cache: Dict[str, PingSample] = {
+            name: PingSample(address=address, ping_count=self.ping_count)
+            for name, address in self.targets
+        }
 
-        # Stale threshold: if no successful poll within max_data_age_s,
-        # republished statuses are downgraded to STALE so consumers that
-        # only read DiagnosticStatus.level (not the last_query_time
-        # KeyValue) still see real polling stalls. 0 = auto, 3*poll.
-        max_data_age_s = self.get_parameter(
-            'max_data_age_s'
-        ).value
-        if max_data_age_s <= 0.0:
-            max_data_age_s = 3.0 * self.poll_interval
-        self._max_data_age = Duration(seconds=max_data_age_s)
+        # diagnostic_updater.Updater publishes all registered tasks at
+        # update_period_sec regardless of poll timing.  Tasks have fixed
+        # names (one per static target) — no dynamic membership here.
+        self._updater = diagnostic_updater.Updater(
+            self, period=update_period_sec,
+        )
+        self._updater.setHardwareID(self.hardware_id or '')
+        for name, _address in self.targets:
+            task_name = f'{self._name_prefix}: {name}'
+            self._updater.add(task_name, self._make_task(name))
 
-        # Separate callback groups so the publish timer can run while a
-        # slow poll is in progress — required by the MultiThreadedExecutor
-        # in main(). With per-target ping deadlines of ping_count *
-        # ping_timeout, a single poll can block for many seconds; without
-        # the split the publish_interval guarantee would be broken
-        # exactly when downstream consumers most need fresh data.
+        # Separate callback group so the Updater's publish timer can run
+        # while a slow poll is in progress.  With per-target ping
+        # deadlines of ping_count * ping_timeout, a single poll can block
+        # for many seconds; without the split the update_period_sec
+        # guarantee would be broken exactly when downstream consumers
+        # most need fresh data.
         self.poll_timer = self.create_timer(
             self.poll_interval,
-            self.poll_callback,
-            callback_group=MutuallyExclusiveCallbackGroup(),
-        )
-        self.publish_timer = self.create_timer(
-            publish_interval,
-            self._publish_callback,
+            self._poll_callback,
             callback_group=MutuallyExclusiveCallbackGroup(),
         )
 
@@ -121,14 +133,37 @@ class PingMonitorNode(Node):
         self.get_logger().info(
             f'Ping monitor started: [{target_names}] '
             f'poll every {self.poll_interval}s, '
-            f'publish every {publish_interval}s'
+            f'publish every {update_period_sec}s'
         )
+
+    def _make_task(self, target_name: str):
+        """Build an Updater task callback for one target."""
+        def _task(stat):
+            with self._cache_lock:
+                sample = self._cache[target_name]
+            level, message, kvs = synthesize_ping_status(
+                sample,
+                self._stale_timeout_sec,
+                time.monotonic(),
+            )
+            stat.summary(level, message)
+            for kv in kvs:
+                stat.add(kv.key, kv.value)
+            return stat
+        return _task
 
     def _ping(self, address):
         """
-        Ping an address and return (success, latency_ms, loss_pct).
+        Ping an address and return (success, latency_ms, loss_pct, error).
 
-        Uses the system ping command to avoid requiring raw socket privileges.
+        ``error`` is ``None`` on success, or a short human-readable string
+        describing the failure mode (missing ping binary, subprocess
+        timeout, nonzero exit).  Callers propagate it into
+        ``PingSample.error_message`` so the ``: <target>`` task surfaces
+        a specific reason instead of a generic "Unreachable".
+
+        Uses the system ping command to avoid requiring raw socket
+        privileges.
         """
         timeout_s = max(1, math.ceil(self.ping_timeout))
         deadline = timeout_s * self.ping_count + 1
@@ -146,9 +181,11 @@ class PingMonitorNode(Node):
                 timeout=deadline + 5,
             )
         except subprocess.TimeoutExpired:
-            return False, 0.0, 100.0
+            return False, 0.0, 100.0, (
+                f'subprocess timeout after {deadline + 5}s'
+            )
         except FileNotFoundError:
-            return False, 0.0, 100.0
+            return False, 0.0, 100.0, 'ping binary not found'
 
         loss = 100.0
         latency = 0.0
@@ -158,7 +195,6 @@ class PingMonitorNode(Node):
                 # "3 packets transmitted, 3 received, 0% packet loss"
                 try:
                     loss_str = line.split('%')[0].rsplit(None, 1)[-1]
-                    # Remove any leading comma
                     loss_str = loss_str.lstrip(',').strip()
                     loss = float(loss_str)
                 except (ValueError, IndexError):
@@ -171,80 +207,40 @@ class PingMonitorNode(Node):
                 except (ValueError, IndexError):
                     pass
 
-        success = result.returncode == 0 and loss < 100.0
-        return success, latency, loss
+        # Reachability is defined by packet loss, not ping's return code.
+        # Linux ping exits 0 on full success, 1 on partial loss (host
+        # IS reachable — should render as WARN), and 2 on network or
+        # command errors (which always also produce 100% loss in the
+        # parsed output, or the parser's default 100.0 if no summary
+        # line appeared).  An earlier version used
+        # ``returncode == 0 and loss < 100.0``, which wrongly collapsed
+        # the partial-loss WARN case into ERROR via returncode==1.
+        success = loss < 100.0
+        error = None if success else 'Unreachable (100% packet loss)'
+        return success, latency, loss, error
 
-    def poll_callback(self):
-        msg = DiagnosticArray()
-
+    def _poll_callback(self):
+        """Ping every target sequentially; update cache atomically per target."""
         for name, address in self.targets:
             # Stamp each target individually — pings are sequential and
-            # individual ping_count * ping_timeout windows can stretch
-            # the per-target loop across many seconds.
-            query_time_iso = datetime.now(timezone.utc).isoformat()
-            success, latency_ms, loss_pct = self._ping(address)
+            # one target's ping_count * ping_timeout window can stretch
+            # many seconds past the start of the loop.
+            poll_wall_iso = datetime.now(timezone.utc).isoformat()
+            success, latency_ms, loss_pct, error_message = self._ping(address)
+            poll_monotonic = time.monotonic()
 
-            status = DiagnosticStatus()
-            status.name = f'{self._name_prefix}: {name}'
-            status.hardware_id = self.hardware_id or address
-
-            if not success:
-                status.level = DiagnosticStatus.ERROR
-                status.message = 'Unreachable'
-            elif loss_pct > 0.0:
-                status.level = DiagnosticStatus.WARN
-                status.message = f'{loss_pct:.0f}% packet loss'
-            else:
-                status.level = DiagnosticStatus.OK
-                status.message = f'{latency_ms:.1f} ms'
-
-            status.values.append(
-                KeyValue(key='address', value=address)
+            new_sample = PingSample(
+                address=address,
+                success=success,
+                latency_ms=latency_ms,
+                loss_pct=loss_pct,
+                ping_count=self.ping_count,
+                poll_monotonic=poll_monotonic,
+                poll_wall_iso=poll_wall_iso,
+                error_message=error_message,
             )
-            status.values.append(
-                KeyValue(key='latency_ms', value=f'{latency_ms:.3f}')
-            )
-            status.values.append(
-                KeyValue(key='packet_loss_pct', value=f'{loss_pct:.1f}')
-            )
-            status.values.append(
-                KeyValue(key='reachable', value=str(success))
-            )
-            status.values.append(
-                KeyValue(key='ping_count', value=str(self.ping_count))
-            )
-            status.values.append(
-                KeyValue(key='last_query_time', value=query_time_iso)
-            )
-
-            msg.status.append(status)
-
-        with self._cache_lock:
-            self._cached_msg = msg
-            self._last_poll_time = self.get_clock().now()
-
-    def _publish_callback(self):
-        with self._cache_lock:
-            msg = self._cached_msg
-            last_poll = self._last_poll_time
-        if msg is None:
-            return
-
-        now = self.get_clock().now()
-        msg.header.stamp = now.to_msg()
-
-        # Downgrade levels to STALE if the cached data is older than
-        # max_data_age. Consumers that only read status.level (not the
-        # last_query_time KeyValue) need this to detect polling stalls.
-        # Mutates the cached msg in place — safe because the next
-        # successful poll fully replaces the cache.
-        if last_poll is not None and (now - last_poll) > self._max_data_age:
-            age_s = (now - last_poll).nanoseconds / 1e9
-            for status in msg.status:
-                status.level = DiagnosticStatus.STALE
-                status.message = f'STALE: {age_s:.1f}s since last poll'
-
-        self.diag_pub.publish(msg)
+            with self._cache_lock:
+                self._cache[name] = new_sample
 
 
 def main(args=None):
