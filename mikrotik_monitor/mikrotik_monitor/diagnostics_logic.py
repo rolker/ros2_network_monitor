@@ -164,16 +164,31 @@ def synthesize_connection_status(
 
     Replaces the bug-creating "rename-on-error" status that the pre-Updater
     node emitted.  Name stays fixed as ``<prefix>: connection``; level
-    reflects whether the last poll succeeded.
+    reflects the outcome of the most recent poll attempt.
+
+    ``cache.error_message`` is checked first, before staleness, because
+    the connection task exists specifically to surface the most recent
+    poll attempt's outcome.  That means:
+
+    - On first-poll failure (``poll_monotonic == 0.0`` still at its
+      initial default, ``error_message`` set by the preservation path),
+      report ERROR with the real reason rather than the generic
+      "no successful poll yet" STALE.  The other per-entity tasks still
+      emit STALE because they have no cached data to render — that's
+      correct for them, but hides the connection error from the
+      connection task's consumer if we did the same here.
+    - When a formerly-fresh cache ages past ``stale_timeout_sec`` AND
+      the most recent attempt errored, the error message is the
+      freshest real news, so surface it instead of "cached data Ns old".
     """
     kvs: list[KeyValue] = [_last_query_kv(cache)]
+
+    if cache.error_message:
+        return DiagnosticStatus.ERROR, cache.error_message, kvs
 
     stale_msg = _is_cache_stale(cache, stale_timeout_sec, now_monotonic)
     if stale_msg is not None:
         return DiagnosticStatus.STALE, stale_msg, kvs
-
-    if cache.error_message:
-        return DiagnosticStatus.ERROR, cache.error_message, kvs
 
     return DiagnosticStatus.OK, 'reachable', kvs
 

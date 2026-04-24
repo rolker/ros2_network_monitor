@@ -91,12 +91,54 @@ def test_connection_error():
 
 
 def test_connection_stale_from_aged_cache():
+    """Cache older than stale_timeout AND no error → STALE (polls stopped)."""
     cache = CachedStatus(
         system_board={'model': 'RUTX11'},
         poll_monotonic=NOW - (STALE + 5.0),
     )
     level, _, _ = synthesize_connection_status(cache, STALE, NOW)
     assert level == DiagnosticStatus.STALE
+
+
+def test_connection_reports_error_on_first_poll_failure():
+    """
+    Regression for V5 (PR #19 round 2 review).
+
+    After the cache-preservation fix, the first-poll-failure cache
+    keeps the initial ``poll_monotonic=0.0`` default and sets
+    ``error_message``.  The connection task must emit ERROR with the
+    real reason — not the generic STALE "no successful poll yet" that
+    an earlier version of ``synthesize_connection_status`` would have
+    returned by checking staleness first.
+    """
+    first_fail_cache = CachedStatus(
+        poll_monotonic=0.0,
+        poll_wall_iso='2026-04-23T20:00:00+00:00',
+        error_message='Connection error: refused',
+    )
+    level, message, _ = synthesize_connection_status(
+        first_fail_cache, STALE, NOW,
+    )
+    assert level == DiagnosticStatus.ERROR
+    assert 'refused' in message
+
+
+def test_connection_error_takes_precedence_over_aged_stale():
+    """
+    When a preserved cache ages past stale_timeout AND the most recent
+    poll attempt errored, the error message is the freshest real news.
+    """
+    aged_error_cache = CachedStatus(
+        system_board={'model': 'RUTX11'},
+        poll_monotonic=NOW - (STALE + 5.0),
+        poll_wall_iso='2026-04-23T19:59:00+00:00',
+        error_message='Connection error: auth',
+    )
+    level, message, _ = synthesize_connection_status(
+        aged_error_cache, STALE, NOW,
+    )
+    assert level == DiagnosticStatus.ERROR
+    assert 'auth' in message
 
 
 # --- System task ---

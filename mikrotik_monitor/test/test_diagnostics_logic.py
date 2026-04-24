@@ -86,7 +86,7 @@ def test_connection_error_surfaces_error_message():
 
 
 def test_connection_stale_when_cache_too_old():
-    """Cache older than stale_timeout → STALE even if previously OK."""
+    """Cache older than stale_timeout AND no error → STALE (polls stopped)."""
     cache = CachedStatus(
         system_resource={'board-name': 'RB4011'},
         poll_monotonic=NOW - (STALE + 5.0),
@@ -95,6 +95,50 @@ def test_connection_stale_when_cache_too_old():
     level, message, _ = synthesize_connection_status(cache, STALE, NOW)
     assert level == DiagnosticStatus.STALE
     assert 'cached data' in message
+
+
+def test_connection_reports_error_on_first_poll_failure():
+    """
+    Regression for V4 (PR #19 round 2 review).
+
+    After the cache-preservation fix, the first-poll-failure cache
+    keeps the initial ``poll_monotonic=0.0`` default (no prior success
+    to preserve from) and sets ``error_message``.  An earlier version
+    of ``synthesize_connection_status`` checked staleness first, so
+    this state incorrectly emitted STALE "no successful poll yet"
+    instead of surfacing the real connection error.  Error takes
+    precedence over staleness in the connection task because its
+    purpose is to reflect the most recent poll attempt's outcome.
+    """
+    first_fail_cache = CachedStatus(
+        poll_monotonic=0.0,  # no prior success to preserve
+        poll_wall_iso='2026-04-23T20:00:00+00:00',
+        error_message='Connection error: refused',
+    )
+    level, message, _ = synthesize_connection_status(
+        first_fail_cache, STALE, NOW,
+    )
+    assert level == DiagnosticStatus.ERROR
+    assert 'refused' in message
+
+
+def test_connection_error_takes_precedence_over_aged_stale():
+    """
+    When a formerly-fresh cache ages past stale_timeout AND the most
+    recent poll attempt errored, the error message is the freshest
+    real news — surface it, not "cached data Ns old".
+    """
+    aged_error_cache = CachedStatus(
+        system_resource={'board-name': 'RB4011'},
+        poll_monotonic=NOW - (STALE + 5.0),
+        poll_wall_iso='2026-04-23T19:59:00+00:00',
+        error_message='Connection error: auth',
+    )
+    level, message, _ = synthesize_connection_status(
+        aged_error_cache, STALE, NOW,
+    )
+    assert level == DiagnosticStatus.ERROR
+    assert 'auth' in message
 
 
 # --- System task ---
