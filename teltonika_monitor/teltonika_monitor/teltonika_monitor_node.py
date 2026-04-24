@@ -344,7 +344,18 @@ class TeltonikaMonitorNode(Node):
         network_interfaces: list[dict],
         now_monotonic: float,
     ):
-        """Add/remove Updater tasks to match observed mwan3 / interface membership."""
+        """Add/remove Updater tasks to match observed mwan3 / interface membership.
+
+        Safe to call from the poll timer's callback group even while
+        the Updater's default-group publish timer is running:
+        ``diagnostic_updater.Updater`` serializes ``add``,
+        ``removeByName``, and ``update`` under a shared
+        ``threading.Lock`` (see
+        ``diagnostic_updater/_diagnostic_updater.py:172,199,213,274``
+        in Jazzy).  Lock ordering is clean — the cache lock is
+        released before the Updater's internal lock is taken — so no
+        deadlock is possible.
+        """
         # mwan3 members — filter by ignored_interfaces (mwan3 names
         # overlap with interface names).
         observed_mwan_names: set[str] = set()

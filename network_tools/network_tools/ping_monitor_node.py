@@ -77,10 +77,13 @@ class PingMonitorNode(Node):
         self.ping_timeout = self.get_parameter('ping_timeout').value
         self.hardware_id = self.get_parameter('hardware_id').value
 
-        # stale_timeout_sec = 0 means "auto" — a cached sample is stale
-        # after 3 poll intervals.  An explicit value lets field tuning
-        # override the heuristic when polls are long (many targets with
-        # generous ping_timeout).
+        # stale_timeout_sec = 0 means "auto": cached sample is considered
+        # stale after 3 poll_intervals.  The 3× factor (vs. 2× for
+        # mikrotik/teltonika) reflects that a sequential ping pass over
+        # many targets with generous ping_timeout can legitimately take
+        # ~2 poll_intervals to complete; tripling gives one missed poll
+        # of headroom before the task flips to STALE.  Explicit values
+        # override for field tuning.
         stale_timeout_sec = self.get_parameter('stale_timeout_sec').value
         if stale_timeout_sec <= 0.0:
             stale_timeout_sec = 3.0 * self.poll_interval

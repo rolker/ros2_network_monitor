@@ -336,7 +336,19 @@ class MikroTikMonitorNode(Node):
         wireless: list[dict],
         now_monotonic: float,
     ):
-        """Add/remove Updater tasks to match the observed membership."""
+        """Add/remove Updater tasks to match the observed membership.
+
+        Called from ``_poll_callback`` on the poll timer's callback
+        group, while the Updater's internal periodic publish timer
+        runs in the node's default group.  Concurrent execution is
+        safe: ``diagnostic_updater.Updater`` serializes ``add``,
+        ``removeByName``, and ``update`` (task iteration) under a
+        shared ``threading.Lock`` — see
+        ``diagnostic_updater/_diagnostic_updater.py:172,199,213,274``
+        in Jazzy.  Lock ordering in this node is clean: the cache
+        lock is released before the Updater's internal lock is
+        acquired, so no deadlock is possible.
+        """
         observed_iface_names = {
             interface_task_name(self._name_prefix, i.get('name', 'unknown'))
             for i in interfaces
