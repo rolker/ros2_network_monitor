@@ -85,6 +85,40 @@ def test_warn_when_partial_loss():
     assert '33% packet loss' in message
 
 
+def test_partial_loss_with_success_true_renders_warn_not_error():
+    """
+    Regression for V7 (PR #19 round 4 review).
+
+    Linux ``ping`` exits with code 1 when the host IS reachable but
+    some packets were lost.  An earlier version of ``_ping`` defined
+    ``success = returncode == 0 and loss < 100.0``, wrongly setting
+    ``success=False`` for the partial-loss case — the node would then
+    cache ``PingSample(success=False, loss_pct=<fraction>)`` which
+    synthesize_ping_status rendered as ERROR "Unreachable" instead of
+    WARN "N% packet loss".  After the fix, ``success`` is derived
+    purely from loss, so this pure-logic path correctly renders WARN
+    whenever a node sets ``success=True`` alongside any loss value.
+
+    This test locks in the invariant by driving the logic with a
+    ``success=True, loss_pct=50.0, error_message=None`` sample that
+    models what ``_ping`` now produces for a returncode==1 partial
+    loss case.
+    """
+    sample = PingSample(
+        address='10.0.0.1',
+        success=True,
+        latency_ms=12.0,
+        loss_pct=50.0,
+        ping_count=2,
+        poll_monotonic=NOW,
+        poll_wall_iso='2026-04-23T20:00:00+00:00',
+        error_message=None,
+    )
+    level, message, _ = synthesize_ping_status(sample, STALE_TIMEOUT, NOW)
+    assert level == DiagnosticStatus.WARN
+    assert '50% packet loss' in message
+
+
 def test_error_when_unreachable():
     sample = PingSample(
         address='10.0.0.1',

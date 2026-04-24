@@ -204,16 +204,16 @@ class PingMonitorNode(Node):
                 except (ValueError, IndexError):
                     pass
 
-        success = result.returncode == 0 and loss < 100.0
-        error = None
-        if not success:
-            # ping exits with 1 when host is reachable but some packets
-            # were lost (loss < 100), and with 2 on network errors or
-            # 100% loss.  Distinguish for operator clarity.
-            if loss >= 100.0:
-                error = 'Unreachable (100% packet loss)'
-            else:
-                error = f'ping exit {result.returncode}'
+        # Reachability is defined by packet loss, not ping's return code.
+        # Linux ping exits 0 on full success, 1 on partial loss (host
+        # IS reachable — should render as WARN), and 2 on network or
+        # command errors (which always also produce 100% loss in the
+        # parsed output, or the parser's default 100.0 if no summary
+        # line appeared).  An earlier version used
+        # ``returncode == 0 and loss < 100.0``, which wrongly collapsed
+        # the partial-loss WARN case into ERROR via returncode==1.
+        success = loss < 100.0
+        error = None if success else 'Unreachable (100% packet loss)'
         return success, latency, loss, error
 
     def _poll_callback(self):
