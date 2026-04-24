@@ -148,7 +148,13 @@ class PingMonitorNode(Node):
 
     def _ping(self, address):
         """
-        Ping an address and return (success, latency_ms, loss_pct).
+        Ping an address and return (success, latency_ms, loss_pct, error).
+
+        ``error`` is ``None`` on success, or a short human-readable string
+        describing the failure mode (missing ping binary, subprocess
+        timeout, nonzero exit).  Callers propagate it into
+        ``PingSample.error_message`` so the ``: <target>`` task surfaces
+        a specific reason instead of a generic "Unreachable".
 
         Uses the system ping command to avoid requiring raw socket
         privileges.
@@ -169,9 +175,11 @@ class PingMonitorNode(Node):
                 timeout=deadline + 5,
             )
         except subprocess.TimeoutExpired:
-            return False, 0.0, 100.0
+            return False, 0.0, 100.0, (
+                f'subprocess timeout after {deadline + 5}s'
+            )
         except FileNotFoundError:
-            return False, 0.0, 100.0
+            return False, 0.0, 100.0, 'ping binary not found'
 
         loss = 100.0
         latency = 0.0
@@ -194,7 +202,16 @@ class PingMonitorNode(Node):
                     pass
 
         success = result.returncode == 0 and loss < 100.0
-        return success, latency, loss
+        error = None
+        if not success:
+            # ping exits with 1 when host is reachable but some packets
+            # were lost (loss < 100), and with 2 on network errors or
+            # 100% loss.  Distinguish for operator clarity.
+            if loss >= 100.0:
+                error = 'Unreachable (100% packet loss)'
+            else:
+                error = f'ping exit {result.returncode}'
+        return success, latency, loss, error
 
     def _poll_callback(self):
         """Ping every target sequentially; update cache atomically per target."""
@@ -203,7 +220,7 @@ class PingMonitorNode(Node):
             # one target's ping_count * ping_timeout window can stretch
             # many seconds past the start of the loop.
             poll_wall_iso = datetime.now(timezone.utc).isoformat()
-            success, latency_ms, loss_pct = self._ping(address)
+            success, latency_ms, loss_pct, error_message = self._ping(address)
             poll_monotonic = time.monotonic()
 
             new_sample = PingSample(
@@ -214,6 +231,7 @@ class PingMonitorNode(Node):
                 ping_count=self.ping_count,
                 poll_monotonic=poll_monotonic,
                 poll_wall_iso=poll_wall_iso,
+                error_message=error_message,
             )
             with self._cache_lock:
                 self._cache[name] = new_sample
