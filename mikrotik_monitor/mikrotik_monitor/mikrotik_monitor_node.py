@@ -238,11 +238,20 @@ class MikroTikMonitorNode(Node):
                 system_health = self.client.get_system_health()
             except RouterOSClientError:
                 system_health = None
-            raw_interfaces = self.client.get_interfaces()
-            interfaces = [
-                i for i in raw_interfaces
-                if i.get('name', 'unknown') not in self._ignored_interfaces
-            ]
+            # Wrap get_interfaces individually for symmetry with the
+            # other sub-queries — a partial failure here should not
+            # discard the already-successful system_resource.
+            try:
+                raw_interfaces = self.client.get_interfaces()
+                interfaces = [
+                    i for i in raw_interfaces
+                    if i.get('name', 'unknown') not in self._ignored_interfaces
+                ]
+            except RouterOSClientError as e:
+                self.get_logger().warning(
+                    f'Failed to query interfaces: {e}'
+                )
+                interfaces = None  # sentinel: "don't know"; preserve prior
             try:
                 raw_wireless = self.client.get_wireless_registrations()
                 wireless = [
@@ -257,31 +266,68 @@ class MikroTikMonitorNode(Node):
                     self.get_logger().warning(
                         f'Failed to query wireless registrations: {e}'
                     )
-                    wireless = []
+                    wireless = None  # sentinel: preserve prior
         except RouterOSClientError as e:
             error_message = f'Connection error: {e}'
             self.get_logger().warning(f'Failed to poll device: {e}')
 
-        poll_monotonic = time.monotonic()
-        new_cache = CachedStatus(
-            system_resource=system_resource,
-            system_health=system_health,
-            interfaces=interfaces,
-            wireless=wireless,
-            poll_monotonic=poll_monotonic,
-            poll_wall_iso=poll_wall_iso,
-            error_message=error_message,
-        )
         with self._cache_lock:
+            prev = self._cache
+            if error_message is None:
+                # Successful outer poll.  Use freshly-fetched fields,
+                # substituting the previous cache value for any sub-query
+                # that returned None (sentinel from inner except).
+                # poll_monotonic advances to "now" because we have fresh
+                # confirmation of device reachability.
+                new_cache = CachedStatus(
+                    system_resource=system_resource,
+                    system_health=(
+                        system_health if system_health is not None
+                        else prev.system_health
+                    ),
+                    interfaces=(
+                        interfaces if interfaces is not None
+                        else prev.interfaces
+                    ),
+                    wireless=(
+                        wireless if wireless is not None
+                        else prev.wireless
+                    ),
+                    poll_monotonic=time.monotonic(),
+                    poll_wall_iso=poll_wall_iso,
+                    error_message=None,
+                )
+            else:
+                # Outer connection failure.  Preserve previous cache
+                # fields so per-task callbacks keep rendering last-known
+                # data until the cache ages past stale_timeout_sec.
+                # poll_monotonic stays at the previous successful value
+                # (drives STALE emission).  poll_wall_iso updates so the
+                # last_query_time KeyValue reflects the most recent poll
+                # *attempt*.
+                new_cache = CachedStatus(
+                    system_resource=prev.system_resource,
+                    system_health=prev.system_health,
+                    interfaces=prev.interfaces,
+                    wireless=prev.wireless,
+                    poll_monotonic=prev.poll_monotonic,
+                    poll_wall_iso=poll_wall_iso,
+                    error_message=error_message,
+                )
             self._cache = new_cache
+            reconcile_monotonic = new_cache.poll_monotonic
+            reconcile_interfaces = new_cache.interfaces
+            reconcile_wireless = new_cache.wireless
 
-        # Dynamic-membership reconciliation is skipped on an outright
-        # connection failure — we don't know the current membership, so
-        # leave the registered tasks alone and let them emit STALE via
-        # their own callbacks.
+        # Dynamic-membership reconciliation only runs on a successful
+        # outer poll — on failure we don't know the current membership,
+        # so leave the registered tasks alone and let them emit STALE
+        # via their own callbacks once the preserved cache ages out.
         if error_message is None:
             self._reconcile_dynamic_tasks(
-                interfaces, wireless, poll_monotonic,
+                reconcile_interfaces,
+                reconcile_wireless,
+                reconcile_monotonic,
             )
 
     def _reconcile_dynamic_tasks(

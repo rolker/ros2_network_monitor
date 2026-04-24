@@ -209,6 +209,83 @@ def test_schema_drift_connection_task_name_stable_across_states():
     # that invents a different task name.
 
 
+def test_cache_preserved_across_transient_failure():
+    """
+    Regression for F1/V2 (PR #19).
+
+    On a transient connection failure, tasks must continue rendering the
+    last-known values — they only flip to STALE once the preserved cache
+    ages past stale_timeout_sec.  This is the "graceful degradation"
+    property Starlink's pattern achieves by keeping the previous cache's
+    payload and poll_monotonic on error.
+
+    The node code is what preserves the cache; this test validates the
+    consequence: given a cache that looks like "last successful poll
+    was 1s ago, most recent poll attempt errored", tasks render the
+    preserved values (NOT stale, NOT the error message) until the
+    stale-age check trips.
+    """
+    # Build a cache representing "router was reachable, last successful
+    # poll 1s ago, most recent attempt failed."  The node's poll_callback
+    # should have preserved system_resource/interfaces/wireless from the
+    # prior cache and only touched error_message + poll_wall_iso.
+    preserved_cache = CachedStatus(
+        system_resource={'board-name': 'RB4011', 'cpu-load': '5'},
+        interfaces=[{'name': 'ether1', 'running': 'true'}],
+        wireless=[],
+        poll_monotonic=NOW - 1.0,  # previous successful poll, still fresh
+        poll_wall_iso='2026-04-23T20:00:00+00:00',
+        error_message='Connection error: refused',  # most recent attempt
+    )
+
+    # : connection task surfaces the error (its job).
+    level, message, _ = synthesize_connection_status(
+        preserved_cache, STALE, NOW,
+    )
+    assert level == DiagnosticStatus.ERROR
+    assert 'refused' in message
+
+    # : system task keeps rendering OK from preserved data.  This is the
+    # critical property — WITHOUT the preservation fix, system_resource
+    # would be None and this would return ERROR "system_resource not
+    # cached" on every publish after the first transient failure.
+    level, message, _ = synthesize_system_status(
+        preserved_cache, STALE, NOW,
+    )
+    assert level == DiagnosticStatus.OK
+    assert message == 'RB4011'
+
+    # Per-interface task keeps rendering Running.
+    level, message, _ = synthesize_interface_status(
+        preserved_cache, 'ether1', STALE, NOW,
+    )
+    assert level == DiagnosticStatus.OK
+    assert message == 'Running'
+
+
+def test_preserved_cache_ages_into_stale():
+    """
+    Complement to test_cache_preserved_across_transient_failure.
+
+    When poll_monotonic stays at the previous successful time (per the
+    preservation fix), ongoing failures eventually drive tasks to STALE
+    via _is_cache_stale — they don't report stale values forever.
+    """
+    cache = CachedStatus(
+        system_resource={'board-name': 'RB4011'},
+        interfaces=[{'name': 'ether1', 'running': 'true'}],
+        poll_monotonic=NOW - (STALE + 5.0),  # past stale timeout
+        poll_wall_iso='2026-04-23T19:00:00+00:00',
+        error_message='Connection error: refused',
+    )
+
+    # Non-connection tasks emit STALE via the age check.
+    level, _, _ = synthesize_system_status(cache, STALE, NOW)
+    assert level == DiagnosticStatus.STALE
+    level, _, _ = synthesize_interface_status(cache, 'ether1', STALE, NOW)
+    assert level == DiagnosticStatus.STALE
+
+
 def test_schema_drift_interfaces_drop_does_not_cascade():
     """
     When a poll fails, interfaces/wireless aren't re-observed — so the

@@ -228,11 +228,11 @@ class TeltonikaMonitorNode(Node):
         poll_wall_iso = datetime.now(timezone.utc).isoformat()
         error_message = None
         system_board = None
-        cellular_signal = None
-        cellular_supported = True
-        mwan3 = None
-        mwan3_supported = True
-        network_interfaces: list[dict] = []
+        cellular_signal: dict | None = None
+        cellular_supported: bool | None = None  # None → inherit prior
+        mwan3: dict | None = None
+        mwan3_supported: bool | None = None     # None → inherit prior
+        network_interfaces: list[dict] | None = None  # None → inherit prior
 
         try:
             system_board = self.client.get_system_board()
@@ -240,6 +240,7 @@ class TeltonikaMonitorNode(Node):
             if self._publish_cellular:
                 try:
                     cellular_signal = self.client.get_signal()
+                    cellular_supported = True
                 except UbusClientError as e:
                     if e.code == 3:
                         cellular_supported = False
@@ -247,10 +248,11 @@ class TeltonikaMonitorNode(Node):
                         self.get_logger().warning(
                             f'Failed to query cellular signal: {e}'
                         )
-                        cellular_signal = None
+                        # Leave cellular_supported=None (inherit prior)
 
             try:
                 mwan3 = self.client.get_mwan3_status()
+                mwan3_supported = True
             except UbusClientError as e:
                 if e.code == 3:
                     mwan3_supported = False
@@ -258,7 +260,7 @@ class TeltonikaMonitorNode(Node):
                     self.get_logger().warning(
                         f'Failed to query mwan3 status: {e}'
                     )
-                    mwan3 = None
+                    # Leave mwan3_supported=None (inherit prior)
 
             try:
                 result = self.client.get_network_interfaces()
@@ -271,29 +273,69 @@ class TeltonikaMonitorNode(Node):
                     self.get_logger().warning(
                         f'Failed to query network interfaces: {e}'
                     )
-                network_interfaces = []
+                # Leave network_interfaces=None (inherit prior)
         except UbusClientError as e:
             error_message = f'Connection error: {e}'
             self.get_logger().warning(f'Failed to poll router: {e}')
 
-        poll_monotonic = time.monotonic()
-        new_cache = CachedStatus(
-            system_board=system_board,
-            cellular_signal=cellular_signal,
-            cellular_supported=cellular_supported,
-            mwan3=mwan3,
-            mwan3_supported=mwan3_supported,
-            network_interfaces=network_interfaces,
-            poll_monotonic=poll_monotonic,
-            poll_wall_iso=poll_wall_iso,
-            error_message=error_message,
-        )
         with self._cache_lock:
+            prev = self._cache
+            if error_message is None:
+                # Successful outer poll.  Use freshly-fetched fields, but
+                # inherit from prev where a sub-query failed (sentinel
+                # None from inner except).  poll_monotonic advances to
+                # "now" since we have confirmation of device reachability.
+                new_cache = CachedStatus(
+                    system_board=system_board,
+                    cellular_signal=(
+                        cellular_signal if cellular_signal is not None
+                        else prev.cellular_signal
+                    ),
+                    cellular_supported=(
+                        cellular_supported if cellular_supported is not None
+                        else prev.cellular_supported
+                    ),
+                    mwan3=mwan3 if mwan3 is not None else prev.mwan3,
+                    mwan3_supported=(
+                        mwan3_supported if mwan3_supported is not None
+                        else prev.mwan3_supported
+                    ),
+                    network_interfaces=(
+                        network_interfaces if network_interfaces is not None
+                        else prev.network_interfaces
+                    ),
+                    poll_monotonic=time.monotonic(),
+                    poll_wall_iso=poll_wall_iso,
+                    error_message=None,
+                )
+            else:
+                # Outer connection failure.  Preserve previous cache so
+                # per-task callbacks keep rendering last-known data
+                # until it ages past stale_timeout_sec.  poll_monotonic
+                # stays at the previous value (drives STALE emission);
+                # poll_wall_iso updates to reflect the most recent poll
+                # attempt.
+                new_cache = CachedStatus(
+                    system_board=prev.system_board,
+                    cellular_signal=prev.cellular_signal,
+                    cellular_supported=prev.cellular_supported,
+                    mwan3=prev.mwan3,
+                    mwan3_supported=prev.mwan3_supported,
+                    network_interfaces=prev.network_interfaces,
+                    poll_monotonic=prev.poll_monotonic,
+                    poll_wall_iso=poll_wall_iso,
+                    error_message=error_message,
+                )
             self._cache = new_cache
+            reconcile_mwan3 = new_cache.mwan3
+            reconcile_interfaces = new_cache.network_interfaces or []
+            reconcile_monotonic = new_cache.poll_monotonic
 
         if error_message is None:
             self._reconcile_dynamic_tasks(
-                mwan3, network_interfaces, poll_monotonic,
+                reconcile_mwan3,
+                reconcile_interfaces,
+                reconcile_monotonic,
             )
 
     def _reconcile_dynamic_tasks(

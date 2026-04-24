@@ -273,6 +273,83 @@ def test_interface_ipv4_addresses_rendered():
     assert _kvs_dict(kvs)['ipv4'] == '192.168.20.1/24'
 
 
+# --- Cache preservation on transient failure (F2/V1 regression) ---
+
+def test_cache_preserved_across_transient_failure():
+    """
+    Regression for F2/V1 (PR #19).
+
+    After the preservation fix, a cache representing "last successful
+    poll was 1s ago, most recent poll attempt failed" must let non-
+    connection tasks continue to render last-known values.  Without
+    the fix, system_board would be None and every task would
+    immediately flip to ERROR/STALE on a single transient timeout.
+    """
+    preserved_cache = CachedStatus(
+        system_board={'model': 'RUTX11'},
+        cellular_signal={'net_mode': 'LTE', 'rsrp': '-85 dBm', 'sinr': '10 dB'},
+        cellular_supported=True,
+        mwan3={'interfaces': {'wan1': {'status': 'online'}}},
+        mwan3_supported=True,
+        network_interfaces=[{'interface': 'lan', 'up': True}],
+        poll_monotonic=NOW - 1.0,  # previous successful poll, still fresh
+        poll_wall_iso='2026-04-23T20:00:00+00:00',
+        error_message='Connection error: auth',  # most recent attempt
+    )
+
+    # : connection surfaces the error.
+    level, message, _ = synthesize_connection_status(
+        preserved_cache, STALE, NOW,
+    )
+    assert level == DiagnosticStatus.ERROR
+    assert 'auth' in message
+
+    # Other fixed + dynamic tasks render from preserved data.
+    level, message, _ = synthesize_system_status(preserved_cache, STALE, NOW)
+    assert level == DiagnosticStatus.OK
+    assert message == 'RUTX11'
+
+    level, message, _ = synthesize_cellular_status(preserved_cache, STALE, NOW)
+    assert level == DiagnosticStatus.OK
+    assert 'LTE' in message
+
+    level, message, _ = synthesize_mwan3_status(
+        preserved_cache, 'wan1', STALE, NOW,
+    )
+    assert level == DiagnosticStatus.OK
+    assert message == 'Online'
+
+    level, message, _ = synthesize_interface_status(
+        preserved_cache, 'lan', STALE, NOW,
+    )
+    assert level == DiagnosticStatus.OK
+    assert message == 'Up'
+
+
+def test_preserved_cache_ages_into_stale():
+    """Once poll_monotonic ages past stale_timeout_sec, tasks flip to STALE."""
+    cache = CachedStatus(
+        system_board={'model': 'RUTX11'},
+        cellular_signal={'net_mode': 'LTE', 'rsrp': '-85 dBm'},
+        mwan3={'interfaces': {'wan1': {'status': 'online'}}},
+        network_interfaces=[{'interface': 'lan', 'up': True}],
+        poll_monotonic=NOW - (STALE + 5.0),
+        poll_wall_iso='2026-04-23T19:00:00+00:00',
+        error_message='Connection error: auth',
+    )
+    for name, fn in [
+        ('system', synthesize_system_status),
+        ('cellular', synthesize_cellular_status),
+    ]:
+        level, _, _ = fn(cache, STALE, NOW)
+        assert level == DiagnosticStatus.STALE, f'{name} should be STALE'
+
+    level, _, _ = synthesize_mwan3_status(cache, 'wan1', STALE, NOW)
+    assert level == DiagnosticStatus.STALE
+    level, _, _ = synthesize_interface_status(cache, 'lan', STALE, NOW)
+    assert level == DiagnosticStatus.STALE
+
+
 # --- Schema-drift regression ---
 
 def test_schema_drift_connection_task_stable_across_states():
