@@ -271,6 +271,7 @@ class MikroTikMonitorNode(Node):
             error_message = f'Connection error: {e}'
             self.get_logger().warning(f'Failed to poll device: {e}')
 
+        reconcile_args: tuple | None = None
         with self._cache_lock:
             prev = self._cache
             if error_message is None:
@@ -297,6 +298,16 @@ class MikroTikMonitorNode(Node):
                     poll_wall_iso=poll_wall_iso,
                     error_message=None,
                 )
+                # Capture what _reconcile_dynamic_tasks needs BEFORE
+                # releasing the lock so the reconcile call sees a
+                # consistent snapshot even if another poll is already
+                # in flight on another thread.  Only captured on the
+                # success path — failure skips reconciliation entirely.
+                reconcile_args = (
+                    new_cache.interfaces,
+                    new_cache.wireless,
+                    new_cache.poll_monotonic,
+                )
             else:
                 # Outer connection failure.  Preserve previous cache
                 # fields so per-task callbacks keep rendering last-known
@@ -315,20 +326,13 @@ class MikroTikMonitorNode(Node):
                     error_message=error_message,
                 )
             self._cache = new_cache
-            reconcile_monotonic = new_cache.poll_monotonic
-            reconcile_interfaces = new_cache.interfaces
-            reconcile_wireless = new_cache.wireless
 
         # Dynamic-membership reconciliation only runs on a successful
         # outer poll — on failure we don't know the current membership,
         # so leave the registered tasks alone and let them emit STALE
         # via their own callbacks once the preserved cache ages out.
-        if error_message is None:
-            self._reconcile_dynamic_tasks(
-                reconcile_interfaces,
-                reconcile_wireless,
-                reconcile_monotonic,
-            )
+        if reconcile_args is not None:
+            self._reconcile_dynamic_tasks(*reconcile_args)
 
     def _reconcile_dynamic_tasks(
         self,

@@ -97,9 +97,12 @@ class PingMonitorNode(Node):
         # task callbacks on the rclpy thread never see torn values.
         # Seeded with a placeholder so Updater tasks added at __init__
         # have something to read before the first poll completes.
+        # ``ping_count`` is seeded to the configured value so the
+        # ``ping_count`` KeyValue is consistent from the first STALE
+        # publish rather than flipping from 0 once the first poll lands.
         self._cache_lock = threading.Lock()
         self._cache: Dict[str, PingSample] = {
-            name: PingSample(address=address)
+            name: PingSample(address=address, ping_count=self.ping_count)
             for name, address in self.targets
         }
 

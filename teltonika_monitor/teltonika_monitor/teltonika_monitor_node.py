@@ -278,6 +278,7 @@ class TeltonikaMonitorNode(Node):
             error_message = f'Connection error: {e}'
             self.get_logger().warning(f'Failed to poll router: {e}')
 
+        reconcile_args: tuple | None = None
         with self._cache_lock:
             prev = self._cache
             if error_message is None:
@@ -308,6 +309,14 @@ class TeltonikaMonitorNode(Node):
                     poll_wall_iso=poll_wall_iso,
                     error_message=None,
                 )
+                # Capture reconcile inputs BEFORE releasing the lock so
+                # the call sees a consistent snapshot.  Only captured on
+                # the success path — failure skips reconciliation.
+                reconcile_args = (
+                    new_cache.mwan3,
+                    new_cache.network_interfaces or [],
+                    new_cache.poll_monotonic,
+                )
             else:
                 # Outer connection failure.  Preserve previous cache so
                 # per-task callbacks keep rendering last-known data
@@ -327,16 +336,9 @@ class TeltonikaMonitorNode(Node):
                     error_message=error_message,
                 )
             self._cache = new_cache
-            reconcile_mwan3 = new_cache.mwan3
-            reconcile_interfaces = new_cache.network_interfaces or []
-            reconcile_monotonic = new_cache.poll_monotonic
 
-        if error_message is None:
-            self._reconcile_dynamic_tasks(
-                reconcile_mwan3,
-                reconcile_interfaces,
-                reconcile_monotonic,
-            )
+        if reconcile_args is not None:
+            self._reconcile_dynamic_tasks(*reconcile_args)
 
     def _reconcile_dynamic_tasks(
         self,

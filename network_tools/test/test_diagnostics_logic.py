@@ -23,13 +23,22 @@ def _kvs_dict(kvs):
 
 
 def test_never_polled_is_stale():
-    """Before the first poll completes, status is STALE, not ERROR."""
-    sample = PingSample(address='10.0.0.1')  # poll_monotonic = 0.0
+    """
+    Before the first poll completes, status is STALE, not ERROR.
+
+    Mirrors how the node actually seeds its cache: address + ping_count
+    from the configured parameter (V10 fix — otherwise the ``ping_count``
+    KV would report 0 until the first poll lands, inconsistent with the
+    configured value).
+    """
+    sample = PingSample(address='10.0.0.1', ping_count=3)
     level, message, kvs = synthesize_ping_status(sample, STALE_TIMEOUT, NOW)
+    d = _kvs_dict(kvs)
 
     assert level == DiagnosticStatus.STALE
     assert 'no successful poll yet' in message
-    assert _kvs_dict(kvs)['reachable'] == 'False'
+    assert d['reachable'] == 'False'
+    assert d['ping_count'] == '3'
 
 
 def test_cached_sample_aged_past_stale_timeout():
