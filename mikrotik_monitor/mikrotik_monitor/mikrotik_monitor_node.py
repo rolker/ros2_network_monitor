@@ -228,8 +228,8 @@ class MikroTikMonitorNode(Node):
         error_message = None
         system_resource = None
         system_health = None
-        interfaces: list[dict] = []
-        wireless: list[dict] = []
+        interfaces: list[dict] | None = None   # None → inherit prior
+        wireless: list[dict] | None = None     # None → inherit prior
 
         try:
             system_resource = self.client.get_system_resource()
