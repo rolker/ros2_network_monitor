@@ -28,11 +28,14 @@ import diagnostic_updater
 from mikrotik_monitor.diagnostics_logic import (
     CachedStatus,
     diff_dynamic_membership,
+    event_interface,
     interface_task_name,
     synthesize_connection_status,
     synthesize_interface_status,
     synthesize_system_status,
+    synthesize_wireless_events_status,
     synthesize_wireless_status,
+    wireless_events_task_name,
     wireless_task_name,
 )
 from mikrotik_monitor.routeros_client import RouterOSClient, RouterOSClientError
@@ -139,6 +142,7 @@ class MikroTikMonitorNode(Node):
         # Fed to diff_dynamic_membership to drive grace-period removal.
         self._iface_last_seen: dict[str, float] = {}
         self._wireless_last_seen: dict[str, float] = {}
+        self._event_iface_last_seen: dict[str, float] = {}
 
         # diagnostic_updater.Updater publishes all registered tasks at
         # update_period_sec regardless of poll timing.
@@ -216,6 +220,17 @@ class MikroTikMonitorNode(Node):
             return _emit(stat, level, message, kvs)
         return _task
 
+    def _make_events_task(self, iface: str):
+        def _task(stat):
+            level, message, kvs = synthesize_wireless_events_status(
+                self._cache_snapshot(),
+                iface,
+                self._stale_timeout_sec,
+                time.monotonic(),
+            )
+            return _emit(stat, level, message, kvs)
+        return _task
+
     def _cache_snapshot(self) -> CachedStatus:
         with self._cache_lock:
             return self._cache
@@ -230,6 +245,7 @@ class MikroTikMonitorNode(Node):
         system_health = None
         interfaces: list[dict] | None = None   # None → inherit prior
         wireless: list[dict] | None = None     # None → inherit prior
+        wireless_events: list[dict] | None = None   # None → inherit prior
 
         try:
             system_resource = self.client.get_system_resource()
@@ -267,6 +283,20 @@ class MikroTikMonitorNode(Node):
                         f'Failed to query wireless registrations: {e}'
                     )
                     wireless = None  # sentinel: preserve prior
+            # Wireless event log — used by the per-radio events/<iface>
+            # diagnostic task.  RouterOSClient.get_log() fetches the full
+            # /log buffer and filters by topic substring in Python
+            # (RouterOS REST topic-filter semantics are inconsistent
+            # across versions, see routeros_client.get_log docstring).
+            # Worth revisiting if log volume becomes a perf concern on
+            # busy devices.
+            try:
+                wireless_events = self.client.get_log(topics_filter='wireless')
+            except RouterOSClientError as e:
+                self.get_logger().warning(
+                    f'Failed to query log: {e}'
+                )
+                wireless_events = None  # sentinel: preserve prior
         except RouterOSClientError as e:
             error_message = f'Connection error: {e}'
             self.get_logger().warning(f'Failed to poll device: {e}')
@@ -274,12 +304,18 @@ class MikroTikMonitorNode(Node):
         reconcile_args: tuple | None = None
         with self._cache_lock:
             prev = self._cache
+            poll_now = time.monotonic()
             if error_message is None:
                 # Successful outer poll.  Use freshly-fetched fields,
                 # substituting the previous cache value for any sub-query
                 # that returned None (sentinel from inner except).
                 # poll_monotonic advances to "now" because we have fresh
                 # confirmation of device reachability.
+                #
+                # wireless_events_last_success_monotonic only advances
+                # when the /log fetch itself succeeded — that way the
+                # events/<iface> task surfaces STALE even if the outer
+                # poll keeps succeeding while /log keeps failing.
                 new_cache = CachedStatus(
                     system_resource=system_resource,
                     system_health=(
@@ -294,8 +330,28 @@ class MikroTikMonitorNode(Node):
                         wireless if wireless is not None
                         else prev.wireless
                     ),
-                    poll_monotonic=time.monotonic(),
+                    wireless_events=(
+                        wireless_events if wireless_events is not None
+                        else prev.wireless_events
+                    ),
+                    poll_monotonic=poll_now,
                     poll_wall_iso=poll_wall_iso,
+                    system_health_last_success_monotonic=(
+                        poll_now if system_health is not None
+                        else prev.system_health_last_success_monotonic
+                    ),
+                    interfaces_last_success_monotonic=(
+                        poll_now if interfaces is not None
+                        else prev.interfaces_last_success_monotonic
+                    ),
+                    wireless_last_success_monotonic=(
+                        poll_now if wireless is not None
+                        else prev.wireless_last_success_monotonic
+                    ),
+                    wireless_events_last_success_monotonic=(
+                        poll_now if wireless_events is not None
+                        else prev.wireless_events_last_success_monotonic
+                    ),
                     error_message=None,
                 )
                 # Capture what _reconcile_dynamic_tasks needs BEFORE
@@ -306,6 +362,7 @@ class MikroTikMonitorNode(Node):
                 reconcile_args = (
                     new_cache.interfaces,
                     new_cache.wireless,
+                    new_cache.wireless_events,
                     new_cache.poll_monotonic,
                 )
             else:
@@ -321,8 +378,21 @@ class MikroTikMonitorNode(Node):
                     system_health=prev.system_health,
                     interfaces=prev.interfaces,
                     wireless=prev.wireless,
+                    wireless_events=prev.wireless_events,
                     poll_monotonic=prev.poll_monotonic,
                     poll_wall_iso=poll_wall_iso,
+                    system_health_last_success_monotonic=(
+                        prev.system_health_last_success_monotonic
+                    ),
+                    interfaces_last_success_monotonic=(
+                        prev.interfaces_last_success_monotonic
+                    ),
+                    wireless_last_success_monotonic=(
+                        prev.wireless_last_success_monotonic
+                    ),
+                    wireless_events_last_success_monotonic=(
+                        prev.wireless_events_last_success_monotonic
+                    ),
                     error_message=error_message,
                 )
             self._cache = new_cache
@@ -338,6 +408,7 @@ class MikroTikMonitorNode(Node):
         self,
         interfaces: list[dict],
         wireless: list[dict],
+        wireless_events: list[dict],
         now_monotonic: float,
     ):
         """Add/remove Updater tasks to match the observed membership.
@@ -397,6 +468,40 @@ class MikroTikMonitorNode(Node):
         for task_name in to_remove:
             self._updater.removeByName(task_name)
         self._wireless_last_seen = new_last_seen
+
+        # Wireless events — per-radio task scoped by interface name.
+        # Membership union: any interface seen in the current wireless
+        # registration table OR in the log buffer.  This means a radio
+        # gets an event task once it has either an active peer or any
+        # logged event — covers steady-state (peer associated) and
+        # post-drop (peer gone but events remain in log).
+        observed_event_ifaces = {
+            w.get('interface', 'unknown') for w in wireless
+        } | {
+            iface for e in wireless_events
+            if (iface := event_interface(e)) is not None
+        }
+        observed_event_ifaces.discard('unknown')
+        observed_event_iface_names = {
+            wireless_events_task_name(self._name_prefix, iface)
+            for iface in observed_event_ifaces
+            if iface not in self._ignored_interfaces
+        }
+        to_add, to_remove, new_last_seen = diff_dynamic_membership(
+            observed_event_iface_names,
+            set(self._event_iface_last_seen.keys()),
+            self._event_iface_last_seen,
+            self._dynamic_task_grace_sec,
+            now_monotonic,
+        )
+        for task_name in to_add:
+            iface_name = task_name[len(self._name_prefix) + len(': events/'):]
+            self._updater.add(
+                task_name, self._make_events_task(iface_name),
+            )
+        for task_name in to_remove:
+            self._updater.removeByName(task_name)
+        self._event_iface_last_seen = new_last_seen
 
 
 def _emit(stat, level: int, message: str, kvs):

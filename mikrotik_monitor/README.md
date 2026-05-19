@@ -31,6 +31,15 @@ Each poll publishes a `DiagnosticArray` containing:
   state, tx/rx bytes, packets, errors, drops, link-downs
 - **One `DiagnosticStatus` per wireless registration** — signal strength,
   signal-to-noise ratio, tx/rx rate, CCQ, uptime
+- **One `DiagnosticStatus` per wireless radio interface** (`events/<iface>`)
+  — surfaces association / disassociation / deauth events from the
+  RouterOS log buffer. Fields: `last_assoc`, `last_drop` (with reason),
+  `drops_last_5min`, `drops_last_60min`, `current_session_age_sec`.
+  Level is always **OK** as long as the underlying poll is healthy:
+  wireless drops are routine for marine ops (over-horizon / out-of-range
+  is a valid mode of operation), so this task surfaces the data
+  unjudged. Downstream annunciators with range awareness or
+  bag-time forensics can apply context.
 
 ## Launch
 

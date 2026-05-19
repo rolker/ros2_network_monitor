@@ -15,6 +15,8 @@ the standard level constants.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+import re
 from typing import Optional
 
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
@@ -31,6 +33,11 @@ def interface_task_name(name_prefix: str, iface_name: str) -> str:
 def wireless_task_name(name_prefix: str, iface: str, mac: str) -> str:
     """Build the full task name for a per-wireless-registration diagnostic."""
     return f'{name_prefix}: wireless/{iface}/{mac}'
+
+
+def wireless_events_task_name(name_prefix: str, iface: str) -> str:
+    """Build the full task name for a per-radio wireless-events diagnostic."""
+    return f'{name_prefix}: events/{iface}'
 
 
 # System-resource fields to surface as KeyValue pairs.
@@ -78,8 +85,21 @@ class CachedStatus:
     system_health: Optional[object] = None   # from /system/health (list or dict)
     interfaces: list[dict] = field(default_factory=list)   # from /interface
     wireless: list[dict] = field(default_factory=list)     # from /interface/wireless/registration-table
+    wireless_events: list[dict] = field(default_factory=list)  # from /log filtered to wireless topics
     poll_monotonic: float = 0.0
     poll_wall_iso: str = ''
+    # Per-sub-query success timestamps.  Tracked separately from
+    # poll_monotonic so per-task callbacks can surface staleness when
+    # the outer poll keeps succeeding while a specific sub-query keeps
+    # failing — otherwise tasks would render OK on indefinitely-old
+    # cached data.  0.0 means "no successful fetch for this sub-query
+    # yet".  system_resource has no separate field because its success
+    # is what defines outer-poll success (errors there route through
+    # the outer except).
+    system_health_last_success_monotonic: float = 0.0
+    interfaces_last_success_monotonic: float = 0.0
+    wireless_last_success_monotonic: float = 0.0
+    wireless_events_last_success_monotonic: float = 0.0
     error_message: Optional[str] = None  # non-None if last poll attempt failed
 
 
@@ -154,6 +174,30 @@ def _is_cache_stale(cache: CachedStatus, stale_timeout_sec: float,
     return None
 
 
+def _is_field_stale(
+    last_success_monotonic: float,
+    stale_timeout_sec: float,
+    now_monotonic: float,
+    field_name: str,
+) -> Optional[str]:
+    """Per-sub-query equivalent of ``_is_cache_stale``.
+
+    Lets a task gate its own staleness on the success timestamp of
+    one specific sub-query (e.g. ``interfaces_last_success_monotonic``)
+    rather than the outer ``poll_monotonic``.  ``last_success_monotonic
+    == 0.0`` means "no successful fetch yet" for that sub-query.
+    """
+    if last_success_monotonic == 0.0:
+        return f'no successful {field_name} query yet'
+    age = now_monotonic - last_success_monotonic
+    if age > stale_timeout_sec:
+        return (
+            f'{field_name} {age:.1f}s old '
+            f'(stale_timeout_sec={stale_timeout_sec})'
+        )
+    return None
+
+
 def synthesize_connection_status(
     cache: CachedStatus,
     stale_timeout_sec: float,
@@ -219,7 +263,13 @@ def synthesize_system_status(
         if key in resource:
             kvs.append(KeyValue(key=key, value=str(resource[key])))
 
-    # Optional health data
+    # Optional health data.  system_health is a separate sub-query that
+    # can fail independently of system_resource (especially on devices
+    # that don't support /system/health at all).  Expose its freshness
+    # as a KV alongside the values so operators can see when the health
+    # numbers are stuck on stale data — without escalating the whole
+    # system task to STALE (system_resource is the primary signal and
+    # is gated by poll_monotonic above).
     health = cache.system_health
     if isinstance(health, list):
         for entry in health:
@@ -231,6 +281,19 @@ def synthesize_system_status(
         for key, value in health.items():
             if key != '.id':
                 kvs.append(KeyValue(key=key, value=str(value)))
+    if cache.system_health_last_success_monotonic > 0.0:
+        health_age = now_monotonic - cache.system_health_last_success_monotonic
+        kvs.append(KeyValue(
+            key='system_health_age_sec',
+            value=f'{health_age:.1f}',
+        ))
+    elif health is not None:
+        # Defensive: should not normally happen — health is cached but
+        # the success timestamp wasn't recorded.  Surface as a hint.
+        kvs.append(KeyValue(
+            key='system_health_age_sec',
+            value='unknown (no success ts)',
+        ))
 
     message = resource.get('board-name', 'unknown')
     return DiagnosticStatus.OK, message, kvs
@@ -245,9 +308,22 @@ def synthesize_interface_status(
     """Render the per-interface task."""
     kvs: list[KeyValue] = [_last_query_kv(cache)]
 
-    stale_msg = _is_cache_stale(cache, stale_timeout_sec, now_monotonic)
+    # Gate on the interfaces sub-query's own success timestamp so
+    # repeated /interface failures surface as STALE even when the outer
+    # poll keeps landing.
+    stale_msg = _is_field_stale(
+        cache.interfaces_last_success_monotonic,
+        stale_timeout_sec,
+        now_monotonic,
+        'interfaces',
+    )
     if stale_msg is not None:
         return DiagnosticStatus.STALE, stale_msg, kvs
+    interfaces_age = now_monotonic - cache.interfaces_last_success_monotonic
+    kvs.append(KeyValue(
+        key='interfaces_poll_age_sec',
+        value=f'{interfaces_age:.1f}',
+    ))
 
     iface = _find_by_key(cache.interfaces, 'name', iface_name)
     if iface is None:
@@ -286,9 +362,22 @@ def synthesize_wireless_status(
     """Render the per-wireless-registration task."""
     kvs: list[KeyValue] = [_last_query_kv(cache)]
 
-    stale_msg = _is_cache_stale(cache, stale_timeout_sec, now_monotonic)
+    # Gate on the wireless sub-query's own success timestamp so repeated
+    # /interface/wireless/registration-table failures surface as STALE
+    # even when the outer poll keeps landing.
+    stale_msg = _is_field_stale(
+        cache.wireless_last_success_monotonic,
+        stale_timeout_sec,
+        now_monotonic,
+        'wireless registrations',
+    )
     if stale_msg is not None:
         return DiagnosticStatus.STALE, stale_msg, kvs
+    wireless_age = now_monotonic - cache.wireless_last_success_monotonic
+    kvs.append(KeyValue(
+        key='wireless_poll_age_sec',
+        value=f'{wireless_age:.1f}',
+    ))
 
     reg = _find_wireless(cache.wireless, iface, mac)
     if reg is None:
@@ -365,3 +454,272 @@ def _find_wireless(items: list[dict], iface: str, mac: str) -> Optional[dict]:
         if item.get('interface') == iface and item.get('mac-address') == mac:
             return item
     return None
+
+
+# ---------------------------------------------------------------------------
+# Wireless-event log surfacing (see ros2_network_monitor#21)
+# ---------------------------------------------------------------------------
+#
+# RouterOS wireless log messages have a consistent "MAC@interface" anchor,
+# e.g. "C4:AD:34:90:72:4C@wlan1: lost connection, extensive data loss" or
+# "C4:AD:34:90:72:4C@wlan1 established connection on 5745000, SSID
+# bizzy_bridge". Extract the interface for per-radio scoping.
+
+_IFACE_AT_RE = re.compile(r'@([A-Za-z0-9_-]+)[\s:]')
+
+
+def event_interface(event: dict) -> Optional[str]:
+    """Extract the RouterOS interface name from a wireless log event.
+
+    Returns None if no ``@interface`` anchor is present in the message.
+    """
+    msg = event.get('message') or ''
+    match = _IFACE_AT_RE.search(msg)
+    return match.group(1) if match else None
+
+
+def classify_event(message: Optional[str]) -> Optional[str]:
+    """Classify a wireless log message as ``'assoc'`` or ``'drop'``.
+
+    Returns None for messages that don't fit either category (other
+    diagnostics-level wireless chatter we don't care about for session
+    accounting).
+    """
+    if not message:
+        return None
+    if 'established connection' in message:
+        return 'assoc'
+    if 'lost connection' in message or 'deauth' in message:
+        return 'drop'
+    return None
+
+
+# RouterOS log time formats observed in the field.  Tried in order.
+_LOG_TIME_FORMATS = (
+    '%Y-%m-%d %H:%M:%S',     # 2026-04-14 09:52:22 (uptime-based, after sync)
+    '%b/%d/%Y %H:%M:%S',     # Mar/09/2026 09:18:05 (after time-zone-name set)
+)
+
+
+def parse_log_time(
+    time_str: str,
+    now_wall_dt: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Parse a RouterOS log ``time`` field into a UTC datetime.
+
+    Accepts three RouterOS log time formats:
+
+    - ``2026-04-14 09:52:22`` (uptime-based, after sync)
+    - ``Mar/09/2026 09:18:05`` (after ``time-zone-name`` set)
+    - ``09:52:22`` (short form for entries that match "today" from the
+      device's perspective; RouterOS emits this until enough wall time
+      passes that the entry is no longer "today" and rolls to a
+      date-prefixed form)
+
+    The short form is composed with ``now_wall_dt``'s date (default:
+    UTC now).  If the composed timestamp would be in the future relative
+    to ``now_wall_dt``, it's rolled back one day to handle midnight
+    crossing (e.g. a ``23:59:50`` short-form entry observed at
+    ``00:00:05`` resolves to *yesterday's* 23:59:50).
+
+    Returns None on parse failure.  Assumes UTC because we configure
+    the bridges with ``time-zone-name=UTC``.  If a deployment ever uses
+    a local time zone, this would need a per-device tz parameter.
+    """
+    if not time_str:
+        return None
+    for fmt in _LOG_TIME_FORMATS:
+        try:
+            dt = datetime.strptime(time_str, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        t = datetime.strptime(time_str, '%H:%M:%S').time()
+    except ValueError:
+        return None
+    if now_wall_dt is None:
+        now_wall_dt = datetime.now(timezone.utc)
+    composed = datetime.combine(now_wall_dt.date(), t, tzinfo=timezone.utc)
+    if composed > now_wall_dt:
+        composed -= timedelta(days=1)
+    return composed
+
+
+def synthesize_wireless_events_status(
+    cache: CachedStatus,
+    iface: str,
+    stale_timeout_sec: float,
+    now_monotonic: float,
+    now_wall_dt: Optional[datetime] = None,
+) -> tuple[int, str, list[KeyValue]]:
+    """Render the per-radio wireless-events task.
+
+    Surfaces association / drop / deauth event metrics from RouterOS's
+    log buffer:
+
+    - ``last_assoc`` — wall-time and "Ns ago" of the most recent
+      ``established connection`` event for this radio.
+    - ``last_drop`` — wall-time, "Ns ago", and reason text of the most
+      recent ``lost connection`` / deauth event.
+    - ``drops_last_5min`` / ``drops_last_60min`` — rolling counters.
+    - ``current_session_age_sec`` — seconds since the most recent
+      ``assoc`` event, IF no later ``drop`` exists.  ``no_active_session``
+      otherwise.
+
+    Severity is **always OK** as long as the underlying poll is healthy.
+    Wireless drops are routine for marine ops (over-horizon / out-of-range
+    is a valid mode of operation; see workspace feedback memory
+    ``feedback_wifi_disconnect_not_an_error``).  Downstream consumers
+    (annunciators with range awareness, bag-time forensics) can apply
+    context to decide whether a drop pattern is concerning.
+    """
+    kvs: list[KeyValue] = [_last_query_kv(cache)]
+
+    # Staleness is gated on the per-sub-query timestamp for the
+    # wireless-event log fetch — not the outer poll_monotonic.  If the
+    # outer poll keeps succeeding but /log keeps failing, this task
+    # surfaces STALE rather than rendering OK on increasingly old data.
+    stale_msg = _is_field_stale(
+        cache.wireless_events_last_success_monotonic,
+        stale_timeout_sec,
+        now_monotonic,
+        'wireless-event log',
+    )
+    if stale_msg is not None:
+        return DiagnosticStatus.STALE, stale_msg, kvs
+    events_age = now_monotonic - cache.wireless_events_last_success_monotonic
+    kvs.append(KeyValue(
+        key='events_poll_age_sec',
+        value=f'{events_age:.1f}',
+    ))
+
+    if now_wall_dt is None:
+        now_wall_dt = datetime.now(timezone.utc)
+
+    # Parse + classify + filter to this interface
+    iface_events: list[tuple[datetime, str, str]] = []   # (when, kind, msg)
+    for event in cache.wireless_events:
+        if event_interface(event) != iface:
+            continue
+        kind = classify_event(event.get('message') or '')
+        if kind is None:
+            continue
+        when = parse_log_time(event.get('time') or '', now_wall_dt=now_wall_dt)
+        if when is None:
+            continue
+        iface_events.append((when, kind, event.get('message') or ''))
+
+    # Sort by time so "last" is reliable regardless of RouterOS's
+    # log-ordering convention.  RouterOS emits log in insertion order
+    # (oldest first); sorting defensively makes the function robust to
+    # future reorderings.
+    iface_events.sort(key=lambda triple: triple[0])
+
+    # Most-recent assoc and drop
+    last_assoc_ts: Optional[datetime] = None
+    last_drop_ts: Optional[datetime] = None
+    last_drop_msg: Optional[str] = None
+    for ts, kind, msg in iface_events:
+        if kind == 'assoc':
+            last_assoc_ts = ts
+        elif kind == 'drop':
+            last_drop_ts = ts
+            last_drop_msg = msg
+
+    # Rolling counters
+    five_min_ago = now_wall_dt - timedelta(minutes=5)
+    sixty_min_ago = now_wall_dt - timedelta(minutes=60)
+    drops_5min = sum(
+        1 for ts, kind, _ in iface_events
+        if kind == 'drop' and ts >= five_min_ago
+    )
+    drops_60min = sum(
+        1 for ts, kind, _ in iface_events
+        if kind == 'drop' and ts >= sixty_min_ago
+    )
+
+    # Current session age: time since last_assoc, only if no later drop.
+    # Clamped to >=0 to handle clock skew between router and monitor host
+    # (a router clock running ahead of the monitor would otherwise yield
+    # a negative age).
+    current_session_age_sec: Optional[int] = None
+    if last_assoc_ts is not None and (
+        last_drop_ts is None or last_assoc_ts > last_drop_ts
+    ):
+        current_session_age_sec = max(
+            0, int((now_wall_dt - last_assoc_ts).total_seconds())
+        )
+
+    # KeyValue output.  "Ns ago" values are clamped to >=0 for the same
+    # clock-skew reason as current_session_age_sec; the absolute log
+    # timestamp is preserved alongside so forensic readers can still see
+    # the original wall time when skew is in play.
+    if last_assoc_ts is not None:
+        ago = max(0, int((now_wall_dt - last_assoc_ts).total_seconds()))
+        kvs.append(KeyValue(
+            key='last_assoc',
+            value=f'{ago}s ago ({last_assoc_ts.isoformat()})',
+        ))
+    else:
+        kvs.append(KeyValue(
+            key='last_assoc',
+            value='never (or older than log buffer)',
+        ))
+
+    if last_drop_ts is not None:
+        ago = max(0, int((now_wall_dt - last_drop_ts).total_seconds()))
+        kvs.append(KeyValue(
+            key='last_drop',
+            value=f'{ago}s ago ({last_drop_ts.isoformat()}): {last_drop_msg}',
+        ))
+    else:
+        kvs.append(KeyValue(
+            key='last_drop',
+            value='never (or older than log buffer)',
+        ))
+
+    kvs.append(KeyValue(key='drops_last_5min', value=str(drops_5min)))
+    kvs.append(KeyValue(key='drops_last_60min', value=str(drops_60min)))
+
+    # Latest-event age, useful both as activity observability and as a
+    # proxy for clock-skew detection: positive = latest event is older
+    # than monitor's "now" (the normal case); negative = the parsed
+    # event timestamp is *ahead* of monitor's "now", which only happens
+    # under router/monitor clock skew (and means rolling-window counts
+    # above are subject to that same skew at the window boundaries).
+    # NOTE: this is NOT a true clock-skew measurement — that would
+    # require fetching /system/clock from RouterOS and diffing against
+    # monitor-now.  When activity is sparse this value drifts upward
+    # even with perfectly synced clocks.  Renamed from clock_skew_sec
+    # to drop the over-promise; real skew metric is a future follow-up.
+    # Reference is the latest event timestamp regardless of kind.
+    latest_event_ts: Optional[datetime] = None
+    if last_assoc_ts is not None and last_drop_ts is not None:
+        latest_event_ts = max(last_assoc_ts, last_drop_ts)
+    else:
+        latest_event_ts = last_assoc_ts or last_drop_ts
+    if latest_event_ts is not None:
+        age = int((now_wall_dt - latest_event_ts).total_seconds())
+        kvs.append(KeyValue(key='latest_event_age_sec', value=str(age)))
+
+    if current_session_age_sec is not None:
+        kvs.append(KeyValue(
+            key='current_session_age_sec',
+            value=str(current_session_age_sec),
+        ))
+    else:
+        kvs.append(KeyValue(
+            key='current_session_age_sec',
+            value='no_active_session',
+        ))
+
+    # Short human message — drops in last hour are the most actionable
+    # at-a-glance signal.  Note: this is descriptive, not alarming
+    # (level stays OK regardless of count).
+    if drops_5min == 0 and drops_60min == 0:
+        message = 'No drops in last hour'
+    else:
+        message = f'{drops_5min} drops in 5min, {drops_60min} in 60min'
+
+    return DiagnosticStatus.OK, message, kvs
