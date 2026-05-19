@@ -15,6 +15,8 @@ the standard level constants.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+import re
 from typing import Optional
 
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
@@ -31,6 +33,11 @@ def interface_task_name(name_prefix: str, iface_name: str) -> str:
 def wireless_task_name(name_prefix: str, iface: str, mac: str) -> str:
     """Build the full task name for a per-wireless-registration diagnostic."""
     return f'{name_prefix}: wireless/{iface}/{mac}'
+
+
+def wireless_events_task_name(name_prefix: str, iface: str) -> str:
+    """Build the full task name for a per-radio wireless-events diagnostic."""
+    return f'{name_prefix}: events/{iface}'
 
 
 # System-resource fields to surface as KeyValue pairs.
@@ -78,6 +85,7 @@ class CachedStatus:
     system_health: Optional[object] = None   # from /system/health (list or dict)
     interfaces: list[dict] = field(default_factory=list)   # from /interface
     wireless: list[dict] = field(default_factory=list)     # from /interface/wireless/registration-table
+    wireless_events: list[dict] = field(default_factory=list)  # from /log filtered to wireless topics
     poll_monotonic: float = 0.0
     poll_wall_iso: str = ''
     error_message: Optional[str] = None  # non-None if last poll attempt failed
@@ -365,3 +373,213 @@ def _find_wireless(items: list[dict], iface: str, mac: str) -> Optional[dict]:
         if item.get('interface') == iface and item.get('mac-address') == mac:
             return item
     return None
+
+
+# ---------------------------------------------------------------------------
+# Wireless-event log surfacing (see ros2_network_monitor#21)
+# ---------------------------------------------------------------------------
+#
+# RouterOS wireless log messages have a consistent "MAC@interface" anchor,
+# e.g. "C4:AD:34:90:72:4C@wlan1: lost connection, extensive data loss" or
+# "C4:AD:34:90:72:4C@wlan1 established connection on 5745000, SSID
+# bizzy_bridge". Extract the interface for per-radio scoping.
+
+_IFACE_AT_RE = re.compile(r'@([A-Za-z0-9_-]+)[\s:]')
+
+
+def event_interface(event: dict) -> Optional[str]:
+    """Extract the RouterOS interface name from a wireless log event.
+
+    Returns None if no ``@interface`` anchor is present in the message.
+    """
+    msg = event.get('message') or ''
+    match = _IFACE_AT_RE.search(msg)
+    return match.group(1) if match else None
+
+
+def classify_event(message: str) -> Optional[str]:
+    """Classify a wireless log message as ``'assoc'`` or ``'drop'``.
+
+    Returns None for messages that don't fit either category (other
+    diagnostics-level wireless chatter we don't care about for session
+    accounting).
+    """
+    if not message:
+        return None
+    if 'established connection' in message:
+        return 'assoc'
+    if 'lost connection' in message or 'deauth' in message:
+        return 'drop'
+    return None
+
+
+# RouterOS log time formats observed in the field.  Tried in order.
+_LOG_TIME_FORMATS = (
+    '%Y-%m-%d %H:%M:%S',     # 2026-04-14 09:52:22 (uptime-based, after sync)
+    '%b/%d/%Y %H:%M:%S',     # Mar/09/2026 09:18:05 (after time-zone-name set)
+)
+
+
+def parse_log_time(time_str: str) -> Optional[datetime]:
+    """Parse a RouterOS log ``time`` field into a UTC datetime.
+
+    Returns None on parse failure.  Assumes UTC because we configure the
+    bridges with ``time-zone-name=UTC``.  If a deployment ever uses a
+    local time zone, this would need a per-device tz parameter.
+
+    The ``%H:%M:%S``-only short form (which RouterOS emits for entries
+    whose date matches "today") is intentionally NOT supported here:
+    without a date the entry's wall time is ambiguous, and downstream
+    code can't compute rolling-window membership reliably.  In practice
+    the wireless events we care about either fall in the same day as
+    "now" (where the short form would work but we'd need extra logic)
+    or are older (where the short form would silently break).  Treat
+    short-form entries as unparseable and drop them.
+    """
+    if not time_str:
+        return None
+    for fmt in _LOG_TIME_FORMATS:
+        try:
+            dt = datetime.strptime(time_str, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def synthesize_wireless_events_status(
+    cache: CachedStatus,
+    iface: str,
+    stale_timeout_sec: float,
+    now_monotonic: float,
+    now_wall_dt: Optional[datetime] = None,
+) -> tuple[int, str, list[KeyValue]]:
+    """Render the per-radio wireless-events task.
+
+    Surfaces association / drop / deauth event metrics from RouterOS's
+    log buffer:
+
+    - ``last_assoc`` — wall-time and "Ns ago" of the most recent
+      ``established connection`` event for this radio.
+    - ``last_drop`` — wall-time, "Ns ago", and reason text of the most
+      recent ``lost connection`` / deauth event.
+    - ``drops_last_5min`` / ``drops_last_60min`` — rolling counters.
+    - ``current_session_age_sec`` — seconds since the most recent
+      ``assoc`` event, IF no later ``drop`` exists.  ``no_active_session``
+      otherwise.
+
+    Severity is **always OK** as long as the underlying poll is healthy.
+    Wireless drops are routine for marine ops (over-horizon / out-of-range
+    is a valid mode of operation; see workspace feedback memory
+    ``feedback_wifi_disconnect_not_an_error``).  Downstream consumers
+    (annunciators with range awareness, bag-time forensics) can apply
+    context to decide whether a drop pattern is concerning.
+    """
+    kvs: list[KeyValue] = [_last_query_kv(cache)]
+
+    stale_msg = _is_cache_stale(cache, stale_timeout_sec, now_monotonic)
+    if stale_msg is not None:
+        return DiagnosticStatus.STALE, stale_msg, kvs
+
+    if now_wall_dt is None:
+        now_wall_dt = datetime.now(timezone.utc)
+
+    # Parse + classify + filter to this interface
+    iface_events: list[tuple[datetime, str, str]] = []   # (when, kind, msg)
+    for event in cache.wireless_events:
+        if event_interface(event) != iface:
+            continue
+        kind = classify_event(event.get('message') or '')
+        if kind is None:
+            continue
+        when = parse_log_time(event.get('time') or '')
+        if when is None:
+            continue
+        iface_events.append((when, kind, event.get('message') or ''))
+
+    # Sort by time so "last" is reliable regardless of RouterOS's
+    # log-ordering convention.  RouterOS emits log in insertion order
+    # (oldest first); sorting defensively makes the function robust to
+    # future reorderings.
+    iface_events.sort(key=lambda triple: triple[0])
+
+    # Most-recent assoc and drop
+    last_assoc_ts: Optional[datetime] = None
+    last_drop_ts: Optional[datetime] = None
+    last_drop_msg: Optional[str] = None
+    for ts, kind, msg in iface_events:
+        if kind == 'assoc':
+            last_assoc_ts = ts
+        elif kind == 'drop':
+            last_drop_ts = ts
+            last_drop_msg = msg
+
+    # Rolling counters
+    five_min_ago = now_wall_dt - timedelta(minutes=5)
+    sixty_min_ago = now_wall_dt - timedelta(minutes=60)
+    drops_5min = sum(
+        1 for ts, kind, _ in iface_events
+        if kind == 'drop' and ts >= five_min_ago
+    )
+    drops_60min = sum(
+        1 for ts, kind, _ in iface_events
+        if kind == 'drop' and ts >= sixty_min_ago
+    )
+
+    # Current session age: time since last_assoc, only if no later drop.
+    current_session_age_sec: Optional[int] = None
+    if last_assoc_ts is not None and (
+        last_drop_ts is None or last_assoc_ts > last_drop_ts
+    ):
+        current_session_age_sec = int(
+            (now_wall_dt - last_assoc_ts).total_seconds()
+        )
+
+    # KeyValue output
+    if last_assoc_ts is not None:
+        ago = int((now_wall_dt - last_assoc_ts).total_seconds())
+        kvs.append(KeyValue(
+            key='last_assoc',
+            value=f'{ago}s ago ({last_assoc_ts.isoformat()})',
+        ))
+    else:
+        kvs.append(KeyValue(
+            key='last_assoc',
+            value='never (or older than log buffer)',
+        ))
+
+    if last_drop_ts is not None:
+        ago = int((now_wall_dt - last_drop_ts).total_seconds())
+        kvs.append(KeyValue(
+            key='last_drop',
+            value=f'{ago}s ago: {last_drop_msg}',
+        ))
+    else:
+        kvs.append(KeyValue(
+            key='last_drop',
+            value='never (or older than log buffer)',
+        ))
+
+    kvs.append(KeyValue(key='drops_last_5min', value=str(drops_5min)))
+    kvs.append(KeyValue(key='drops_last_60min', value=str(drops_60min)))
+
+    if current_session_age_sec is not None:
+        kvs.append(KeyValue(
+            key='current_session_age_sec',
+            value=str(current_session_age_sec),
+        ))
+    else:
+        kvs.append(KeyValue(
+            key='current_session_age_sec',
+            value='no_active_session',
+        ))
+
+    # Short human message — drops in last hour are the most actionable
+    # at-a-glance signal.  Note: this is descriptive, not alarming
+    # (level stays OK regardless of count).
+    if drops_5min == 0 and drops_60min == 0:
+        message = 'No drops in last hour'
+    else:
+        message = f'{drops_5min} drops in 5min, {drops_60min} in 60min'
+
+    return DiagnosticStatus.OK, message, kvs

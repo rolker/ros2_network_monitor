@@ -109,3 +109,23 @@ class RouterOSClient:
     def get_system_health(self):
         """Get system health (temperature, voltage) if available."""
         return self.get('/system/health')
+
+    def get_log(self, topics_filter: str | None = None) -> list[dict]:
+        """Get log entries, optionally filtered client-side by topic substring.
+
+        Returns the full RouterOS log buffer (typically last ~1000 entries).
+        Each entry is a dict with keys including ``.id``, ``time``,
+        ``topics`` (comma-separated), and ``message``.
+
+        Client-side filtering by ``topics_filter`` substring (e.g.,
+        ``"wireless"``) is used because RouterOS REST API's query-string
+        filtering semantics are inconsistent across versions; doing it
+        in Python keeps the contract predictable.
+        """
+        entries = self.get('/log')
+        if topics_filter is None:
+            return entries
+        return [
+            e for e in entries
+            if topics_filter in (e.get('topics') or '')
+        ]
