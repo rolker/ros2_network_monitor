@@ -178,6 +178,7 @@ def test_system_status_handles_dict_health():
         system_resource={'board-name': 'RB4011'},
         system_health={'temperature': 42, '.id': '*1'},
         poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
     )
     _, _, kvs = synthesize_system_status(cache, STALE, NOW)
     d = _kvs_dict(kvs)
@@ -191,6 +192,7 @@ def test_interface_running_ok():
     cache = CachedStatus(
         interfaces=[{'name': 'ether1', 'running': 'true', 'tx-byte': 100}],
         poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
     )
     level, message, kvs = synthesize_interface_status(
         cache, 'ether1', STALE, NOW,
@@ -204,6 +206,7 @@ def test_interface_disabled_warn():
     cache = CachedStatus(
         interfaces=[{'name': 'ether9', 'running': 'false', 'disabled': 'true'}],
         poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
     )
     level, message, _ = synthesize_interface_status(
         cache, 'ether9', STALE, NOW,
@@ -217,6 +220,7 @@ def test_interface_missing_from_cache_stale():
     cache = CachedStatus(
         interfaces=[{'name': 'ether1', 'running': 'true'}],
         poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
     )
     level, message, _ = synthesize_interface_status(
         cache, 'ether-gone', STALE, NOW,
@@ -435,6 +439,7 @@ def test_wireless_ok_with_good_snr():
             'tx-rate': '400Mbps',
         }],
         poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
     )
     level, message, kvs = synthesize_wireless_status(
         cache, 'wlan1', 'AA:BB:CC:DD:EE:FF', STALE, NOW,
@@ -497,8 +502,33 @@ def test_parse_log_time_month_slash_format():
 def test_parse_log_time_invalid():
     assert parse_log_time('') is None
     assert parse_log_time('not a date') is None
-    # The short HH:MM:SS form is deliberately rejected (see docstring)
-    assert parse_log_time('09:52:22') is None
+    # Mangled HH:MM:SS-like strings still fail
+    assert parse_log_time('25:99:99') is None
+
+
+def test_parse_log_time_short_form_uses_today():
+    # The HH:MM:SS short form is composed with now_wall_dt's date.
+    now = datetime(2026, 5, 18, 22, 30, 0, tzinfo=timezone.utc)
+    dt = parse_log_time('22:25:00', now_wall_dt=now)
+    assert dt == datetime(2026, 5, 18, 22, 25, 0, tzinfo=timezone.utc)
+
+
+def test_parse_log_time_short_form_crosses_midnight():
+    # If composing with "today" puts the event in the future relative to
+    # now_wall_dt, roll back one day.  Models the case where RouterOS
+    # logged a 23:59 event and the monitor parses it just after midnight.
+    now = datetime(2026, 5, 19, 0, 0, 5, tzinfo=timezone.utc)
+    dt = parse_log_time('23:59:50', now_wall_dt=now)
+    assert dt == datetime(2026, 5, 18, 23, 59, 50, tzinfo=timezone.utc)
+
+
+def test_parse_log_time_short_form_defaults_to_utc_now():
+    # Sanity check: with no now_wall_dt the function still works
+    # (defaults to datetime.now(UTC)).  Don't assert the actual value
+    # since now() is not deterministic; just assert it parses.
+    dt = parse_log_time('12:34:56')
+    assert dt is not None
+    assert dt.hour == 12 and dt.minute == 34 and dt.second == 56
 
 
 def test_wireless_events_task_name():
@@ -521,11 +551,14 @@ def test_events_stale_cache_before_first_poll():
         cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
     )
     assert level == DiagnosticStatus.STALE
-    assert 'no successful poll' in message
+    assert 'no successful wireless-event log query' in message
 
 
 def test_events_no_events_returns_ok_never():
-    cache = CachedStatus(poll_monotonic=NOW)
+    cache = CachedStatus(
+        poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
+    )
     level, message, kvs = synthesize_wireless_events_status(
         cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
     )
@@ -547,6 +580,7 @@ def test_events_recent_assoc_no_drops_yields_active_session():
                    'AA:BB:CC@wlan1 established connection on 5745000, SSID bridge'),
         ],
         poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
     )
     level, message, kvs = synthesize_wireless_events_status(
         cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
@@ -571,6 +605,7 @@ def test_events_drop_after_last_assoc_no_active_session():
                    'AA:BB:CC@wlan1: lost connection, extensive data loss'),
         ],
         poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
     )
     level, message, kvs = synthesize_wireless_events_status(
         cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
@@ -592,6 +627,7 @@ def test_events_rolling_window_excludes_old_drop():
                    'AA:BB:CC@wlan1: lost connection, extensive data loss'),
         ],
         poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
     )
     _, _, kvs = synthesize_wireless_events_status(
         cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
@@ -609,6 +645,7 @@ def test_events_rolling_window_excludes_ancient_drop():
                    'AA:BB:CC@wlan1: lost connection, extensive data loss'),
         ],
         poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
     )
     _, _, kvs = synthesize_wireless_events_status(
         cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
@@ -630,6 +667,7 @@ def test_events_filters_by_interface():
                    'DD:EE:FF@wlan2: lost connection'),
         ],
         poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
     )
     _, _, kvs_w1 = synthesize_wireless_events_status(
         cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
@@ -641,6 +679,88 @@ def test_events_filters_by_interface():
     assert _kvs_dict(kvs_w2)['drops_last_5min'] == '1'
 
 
+def test_events_stale_when_log_fetch_never_succeeded():
+    # Outer poll succeeded (poll_monotonic=NOW) but /log fetch never did
+    # (wireless_events_last_success_monotonic=0.0).  Per-sub-query
+    # freshness gating means the events task surfaces STALE rather than
+    # rendering OK on the empty/preserved buffer.
+    cache = CachedStatus(poll_monotonic=NOW)
+    level, message, _ = synthesize_wireless_events_status(
+        cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
+    )
+    assert level == DiagnosticStatus.STALE
+    assert 'no successful wireless-event log query' in message
+
+
+def test_events_stale_when_log_fetch_aged_out():
+    # /log last succeeded long enough ago to exceed stale_timeout_sec
+    # even though the outer poll is still landing fresh.
+    cache = CachedStatus(
+        poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW - (STALE + 5.0),
+    )
+    level, message, _ = synthesize_wireless_events_status(
+        cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
+    )
+    assert level == DiagnosticStatus.STALE
+    assert 'wireless-event log' in message
+
+
+def test_events_poll_age_sec_surfaced_when_fresh():
+    # When events fetch is fresh, an events_poll_age_sec KV is exposed
+    # so consumers can see exactly how recent the underlying /log data is.
+    cache = CachedStatus(
+        poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW - 2.5,
+    )
+    _, _, kvs = synthesize_wireless_events_status(
+        cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
+    )
+    d = _kvs_dict(kvs)
+    assert d['events_poll_age_sec'] == '2.5'
+
+
+def test_events_clock_skew_sec_positive_when_log_older_than_now():
+    # Normal case: latest event is older than now_wall_dt → positive skew.
+    cache = CachedStatus(
+        wireless_events=[
+            _event('2026-05-18 22:00:00',
+                   'AA:BB:CC@wlan1 established connection on 5745000, SSID bridge'),
+        ],
+        poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
+    )
+    _, _, kvs = synthesize_wireless_events_status(
+        cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
+    )
+    d = _kvs_dict(kvs)
+    # EVENT_NOW = 22:30:00; event at 22:00:00 → 30 min = 1800s skew
+    assert d['clock_skew_sec'] == '1800'
+
+
+def test_events_negative_ago_clamped_when_router_ahead_of_monitor():
+    # Router clock running ahead: event timestamp is in the future
+    # relative to now_wall_dt.  Without clamping the "Ns ago" fields
+    # and current_session_age_sec would be negative.
+    cache = CachedStatus(
+        wireless_events=[
+            _event('2026-05-18 22:31:00',
+                   'AA:BB:CC@wlan1 established connection on 5745000, SSID bridge'),
+        ],
+        poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
+    )
+    _, _, kvs = synthesize_wireless_events_status(
+        cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
+    )
+    d = _kvs_dict(kvs)
+    # Event at 22:31:00 vs EVENT_NOW 22:30:00 → 60s ahead → clamped to 0
+    assert d['last_assoc'].startswith('0s ago')
+    assert d['current_session_age_sec'] == '0'
+    # The negative skew is still exposed so operators can see the issue.
+    assert d['clock_skew_sec'] == '-60'
+
+
 def test_events_level_stays_ok_with_many_drops():
     """Per feedback_wifi_disconnect_not_an_error: drops are data, not errors."""
     cache = CachedStatus(
@@ -650,6 +770,7 @@ def test_events_level_stays_ok_with_many_drops():
             for i in range(5)  # 5 drops in last 5 min
         ],
         poll_monotonic=NOW,
+        wireless_events_last_success_monotonic=NOW,
     )
     level, _, kvs = synthesize_wireless_events_status(
         cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,

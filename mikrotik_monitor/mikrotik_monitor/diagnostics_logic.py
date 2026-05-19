@@ -88,6 +88,11 @@ class CachedStatus:
     wireless_events: list[dict] = field(default_factory=list)  # from /log filtered to wireless topics
     poll_monotonic: float = 0.0
     poll_wall_iso: str = ''
+    # Per-sub-query success timestamp for the wireless-event log fetch.
+    # Tracked separately from poll_monotonic so the events/<iface> task
+    # surfaces staleness when the outer poll keeps succeeding but the
+    # /log fetch keeps failing.  0.0 means "no successful /log fetch yet".
+    wireless_events_last_success_monotonic: float = 0.0
     error_message: Optional[str] = None  # non-None if last poll attempt failed
 
 
@@ -420,21 +425,30 @@ _LOG_TIME_FORMATS = (
 )
 
 
-def parse_log_time(time_str: str) -> Optional[datetime]:
+def parse_log_time(
+    time_str: str,
+    now_wall_dt: Optional[datetime] = None,
+) -> Optional[datetime]:
     """Parse a RouterOS log ``time`` field into a UTC datetime.
 
-    Returns None on parse failure.  Assumes UTC because we configure the
-    bridges with ``time-zone-name=UTC``.  If a deployment ever uses a
-    local time zone, this would need a per-device tz parameter.
+    Accepts three RouterOS log time formats:
 
-    The ``%H:%M:%S``-only short form (which RouterOS emits for entries
-    whose date matches "today") is intentionally NOT supported here:
-    without a date the entry's wall time is ambiguous, and downstream
-    code can't compute rolling-window membership reliably.  In practice
-    the wireless events we care about either fall in the same day as
-    "now" (where the short form would work but we'd need extra logic)
-    or are older (where the short form would silently break).  Treat
-    short-form entries as unparseable and drop them.
+    - ``2026-04-14 09:52:22`` (uptime-based, after sync)
+    - ``Mar/09/2026 09:18:05`` (after ``time-zone-name`` set)
+    - ``09:52:22`` (short form for entries that match "today" from the
+      device's perspective; RouterOS emits this until enough wall time
+      passes that the entry is no longer "today" and rolls to a
+      date-prefixed form)
+
+    The short form is composed with ``now_wall_dt``'s date (default:
+    UTC now).  If the composed timestamp would be in the future relative
+    to ``now_wall_dt``, it's rolled back one day to handle midnight
+    crossing (e.g. a ``23:59:50`` short-form entry observed at
+    ``00:00:05`` resolves to *yesterday's* 23:59:50).
+
+    Returns None on parse failure.  Assumes UTC because we configure
+    the bridges with ``time-zone-name=UTC``.  If a deployment ever uses
+    a local time zone, this would need a per-device tz parameter.
     """
     if not time_str:
         return None
@@ -444,7 +458,16 @@ def parse_log_time(time_str: str) -> Optional[datetime]:
             return dt.replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-    return None
+    try:
+        t = datetime.strptime(time_str, '%H:%M:%S').time()
+    except ValueError:
+        return None
+    if now_wall_dt is None:
+        now_wall_dt = datetime.now(timezone.utc)
+    composed = datetime.combine(now_wall_dt.date(), t, tzinfo=timezone.utc)
+    if composed > now_wall_dt:
+        composed -= timedelta(days=1)
+    return composed
 
 
 def synthesize_wireless_events_status(
@@ -477,9 +500,30 @@ def synthesize_wireless_events_status(
     """
     kvs: list[KeyValue] = [_last_query_kv(cache)]
 
-    stale_msg = _is_cache_stale(cache, stale_timeout_sec, now_monotonic)
-    if stale_msg is not None:
-        return DiagnosticStatus.STALE, stale_msg, kvs
+    # Staleness is gated on the per-sub-query timestamp for the
+    # wireless-event log fetch — not the outer poll_monotonic.  If the
+    # outer poll keeps succeeding but /log keeps failing, this task
+    # surfaces STALE rather than rendering OK on increasingly old data.
+    if cache.wireless_events_last_success_monotonic == 0.0:
+        return (
+            DiagnosticStatus.STALE,
+            'no successful wireless-event log query yet',
+            kvs,
+        )
+    events_age = now_monotonic - cache.wireless_events_last_success_monotonic
+    if events_age > stale_timeout_sec:
+        return (
+            DiagnosticStatus.STALE,
+            (
+                f'wireless-event log {events_age:.1f}s old '
+                f'(stale_timeout_sec={stale_timeout_sec})'
+            ),
+            kvs,
+        )
+    kvs.append(KeyValue(
+        key='events_poll_age_sec',
+        value=f'{events_age:.1f}',
+    ))
 
     if now_wall_dt is None:
         now_wall_dt = datetime.now(timezone.utc)
@@ -492,7 +536,7 @@ def synthesize_wireless_events_status(
         kind = classify_event(event.get('message') or '')
         if kind is None:
             continue
-        when = parse_log_time(event.get('time') or '')
+        when = parse_log_time(event.get('time') or '', now_wall_dt=now_wall_dt)
         if when is None:
             continue
         iface_events.append((when, kind, event.get('message') or ''))
@@ -527,17 +571,23 @@ def synthesize_wireless_events_status(
     )
 
     # Current session age: time since last_assoc, only if no later drop.
+    # Clamped to >=0 to handle clock skew between router and monitor host
+    # (a router clock running ahead of the monitor would otherwise yield
+    # a negative age).
     current_session_age_sec: Optional[int] = None
     if last_assoc_ts is not None and (
         last_drop_ts is None or last_assoc_ts > last_drop_ts
     ):
-        current_session_age_sec = int(
-            (now_wall_dt - last_assoc_ts).total_seconds()
+        current_session_age_sec = max(
+            0, int((now_wall_dt - last_assoc_ts).total_seconds())
         )
 
-    # KeyValue output
+    # KeyValue output.  "Ns ago" values are clamped to >=0 for the same
+    # clock-skew reason as current_session_age_sec; the absolute log
+    # timestamp is preserved alongside so forensic readers can still see
+    # the original wall time when skew is in play.
     if last_assoc_ts is not None:
-        ago = int((now_wall_dt - last_assoc_ts).total_seconds())
+        ago = max(0, int((now_wall_dt - last_assoc_ts).total_seconds()))
         kvs.append(KeyValue(
             key='last_assoc',
             value=f'{ago}s ago ({last_assoc_ts.isoformat()})',
@@ -549,7 +599,7 @@ def synthesize_wireless_events_status(
         ))
 
     if last_drop_ts is not None:
-        ago = int((now_wall_dt - last_drop_ts).total_seconds())
+        ago = max(0, int((now_wall_dt - last_drop_ts).total_seconds()))
         kvs.append(KeyValue(
             key='last_drop',
             value=f'{ago}s ago: {last_drop_msg}',
@@ -562,6 +612,20 @@ def synthesize_wireless_events_status(
 
     kvs.append(KeyValue(key='drops_last_5min', value=str(drops_5min)))
     kvs.append(KeyValue(key='drops_last_60min', value=str(drops_60min)))
+
+    # Clock-skew observability.  Positive = router log is older than
+    # monitor's "now" (expected); negative = router is ahead of monitor
+    # (the rolling-window counts above are subject to this skew and may
+    # be off by ~|skew| at the window boundaries).  Reference is the
+    # latest event timestamp regardless of kind.
+    latest_event_ts: Optional[datetime] = None
+    if last_assoc_ts is not None and last_drop_ts is not None:
+        latest_event_ts = max(last_assoc_ts, last_drop_ts)
+    else:
+        latest_event_ts = last_assoc_ts or last_drop_ts
+    if latest_event_ts is not None:
+        skew = int((now_wall_dt - latest_event_ts).total_seconds())
+        kvs.append(KeyValue(key='clock_skew_sec', value=str(skew)))
 
     if current_session_age_sec is not None:
         kvs.append(KeyValue(

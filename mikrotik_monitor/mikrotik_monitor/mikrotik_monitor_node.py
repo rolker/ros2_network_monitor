@@ -284,9 +284,12 @@ class MikroTikMonitorNode(Node):
                     )
                     wireless = None  # sentinel: preserve prior
             # Wireless event log — used by the per-radio events/<iface>
-            # diagnostic task.  Filter server-side via topics substring
-            # to limit volume; full log can be hundreds-to-thousands of
-            # entries on busy devices.
+            # diagnostic task.  RouterOSClient.get_log() fetches the full
+            # /log buffer and filters by topic substring in Python
+            # (RouterOS REST topic-filter semantics are inconsistent
+            # across versions, see routeros_client.get_log docstring).
+            # Worth revisiting if log volume becomes a perf concern on
+            # busy devices.
             try:
                 wireless_events = self.client.get_log(topics_filter='wireless')
             except RouterOSClientError as e:
@@ -301,12 +304,18 @@ class MikroTikMonitorNode(Node):
         reconcile_args: tuple | None = None
         with self._cache_lock:
             prev = self._cache
+            poll_now = time.monotonic()
             if error_message is None:
                 # Successful outer poll.  Use freshly-fetched fields,
                 # substituting the previous cache value for any sub-query
                 # that returned None (sentinel from inner except).
                 # poll_monotonic advances to "now" because we have fresh
                 # confirmation of device reachability.
+                #
+                # wireless_events_last_success_monotonic only advances
+                # when the /log fetch itself succeeded — that way the
+                # events/<iface> task surfaces STALE even if the outer
+                # poll keeps succeeding while /log keeps failing.
                 new_cache = CachedStatus(
                     system_resource=system_resource,
                     system_health=(
@@ -325,8 +334,12 @@ class MikroTikMonitorNode(Node):
                         wireless_events if wireless_events is not None
                         else prev.wireless_events
                     ),
-                    poll_monotonic=time.monotonic(),
+                    poll_monotonic=poll_now,
                     poll_wall_iso=poll_wall_iso,
+                    wireless_events_last_success_monotonic=(
+                        poll_now if wireless_events is not None
+                        else prev.wireless_events_last_success_monotonic
+                    ),
                     error_message=None,
                 )
                 # Capture what _reconcile_dynamic_tasks needs BEFORE
@@ -356,6 +369,9 @@ class MikroTikMonitorNode(Node):
                     wireless_events=prev.wireless_events,
                     poll_monotonic=prev.poll_monotonic,
                     poll_wall_iso=poll_wall_iso,
+                    wireless_events_last_success_monotonic=(
+                        prev.wireless_events_last_success_monotonic
+                    ),
                     error_message=error_message,
                 )
             self._cache = new_cache
