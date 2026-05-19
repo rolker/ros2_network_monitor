@@ -478,7 +478,7 @@ def event_interface(event: dict) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def classify_event(message: str) -> Optional[str]:
+def classify_event(message: Optional[str]) -> Optional[str]:
     """Classify a wireless log message as ``'assoc'`` or ``'drop'``.
 
     Returns None for messages that don't fit either category (other
@@ -671,7 +671,7 @@ def synthesize_wireless_events_status(
         ago = max(0, int((now_wall_dt - last_drop_ts).total_seconds()))
         kvs.append(KeyValue(
             key='last_drop',
-            value=f'{ago}s ago: {last_drop_msg}',
+            value=f'{ago}s ago ({last_drop_ts.isoformat()}): {last_drop_msg}',
         ))
     else:
         kvs.append(KeyValue(
@@ -682,19 +682,26 @@ def synthesize_wireless_events_status(
     kvs.append(KeyValue(key='drops_last_5min', value=str(drops_5min)))
     kvs.append(KeyValue(key='drops_last_60min', value=str(drops_60min)))
 
-    # Clock-skew observability.  Positive = router log is older than
-    # monitor's "now" (expected); negative = router is ahead of monitor
-    # (the rolling-window counts above are subject to this skew and may
-    # be off by ~|skew| at the window boundaries).  Reference is the
-    # latest event timestamp regardless of kind.
+    # Latest-event age, useful both as activity observability and as a
+    # proxy for clock-skew detection: positive = latest event is older
+    # than monitor's "now" (the normal case); negative = the parsed
+    # event timestamp is *ahead* of monitor's "now", which only happens
+    # under router/monitor clock skew (and means rolling-window counts
+    # above are subject to that same skew at the window boundaries).
+    # NOTE: this is NOT a true clock-skew measurement — that would
+    # require fetching /system/clock from RouterOS and diffing against
+    # monitor-now.  When activity is sparse this value drifts upward
+    # even with perfectly synced clocks.  Renamed from clock_skew_sec
+    # to drop the over-promise; real skew metric is a future follow-up.
+    # Reference is the latest event timestamp regardless of kind.
     latest_event_ts: Optional[datetime] = None
     if last_assoc_ts is not None and last_drop_ts is not None:
         latest_event_ts = max(last_assoc_ts, last_drop_ts)
     else:
         latest_event_ts = last_assoc_ts or last_drop_ts
     if latest_event_ts is not None:
-        skew = int((now_wall_dt - latest_event_ts).total_seconds())
-        kvs.append(KeyValue(key='clock_skew_sec', value=str(skew)))
+        age = int((now_wall_dt - latest_event_ts).total_seconds())
+        kvs.append(KeyValue(key='latest_event_age_sec', value=str(age)))
 
     if current_session_age_sec is not None:
         kvs.append(KeyValue(

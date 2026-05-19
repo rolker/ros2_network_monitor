@@ -478,8 +478,8 @@ class MikroTikMonitorNode(Node):
         observed_event_ifaces = {
             w.get('interface', 'unknown') for w in wireless
         } | {
-            event_interface(e) for e in wireless_events
-            if event_interface(e) is not None
+            iface for e in wireless_events
+            if (iface := event_interface(e)) is not None
         }
         observed_event_ifaces.discard('unknown')
         observed_event_iface_names = {

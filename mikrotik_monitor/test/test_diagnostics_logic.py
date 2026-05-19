@@ -732,6 +732,8 @@ def test_events_drop_after_last_assoc_no_active_session():
     assert d['drops_last_60min'] == '1'
     assert d['current_session_age_sec'] == 'no_active_session'
     assert 'lost connection' in d['last_drop']
+    # last_drop carries the absolute wall time too (symmetric with last_assoc)
+    assert '2026-05-18T22:27:00+00:00' in d['last_drop']
 
 
 def test_events_rolling_window_excludes_old_drop():
@@ -844,8 +846,8 @@ def test_events_poll_age_sec_surfaced_when_fresh():
     assert d['events_poll_age_sec'] == '2.5'
 
 
-def test_events_clock_skew_sec_positive_when_log_older_than_now():
-    # Normal case: latest event is older than now_wall_dt → positive skew.
+def test_events_latest_event_age_sec_positive_when_log_older_than_now():
+    # Normal case: latest event is older than now_wall_dt → positive age.
     cache = CachedStatus(
         wireless_events=[
             _event('2026-05-18 22:00:00',
@@ -861,8 +863,8 @@ def test_events_clock_skew_sec_positive_when_log_older_than_now():
         cache, 'wlan1', STALE, NOW, now_wall_dt=EVENT_NOW,
     )
     d = _kvs_dict(kvs)
-    # EVENT_NOW = 22:30:00; event at 22:00:00 → 30 min = 1800s skew
-    assert d['clock_skew_sec'] == '1800'
+    # EVENT_NOW = 22:30:00; event at 22:00:00 → 30 min = 1800s age
+    assert d['latest_event_age_sec'] == '1800'
 
 
 def test_events_negative_ago_clamped_when_router_ahead_of_monitor():
@@ -887,8 +889,9 @@ def test_events_negative_ago_clamped_when_router_ahead_of_monitor():
     # Event at 22:31:00 vs EVENT_NOW 22:30:00 → 60s ahead → clamped to 0
     assert d['last_assoc'].startswith('0s ago')
     assert d['current_session_age_sec'] == '0'
-    # The negative skew is still exposed so operators can see the issue.
-    assert d['clock_skew_sec'] == '-60'
+    # Negative age (event in the future from monitor's POV) is still
+    # exposed — diagnostic for router/monitor clock skew.
+    assert d['latest_event_age_sec'] == '-60'
 
 
 def test_events_level_stays_ok_with_many_drops():
