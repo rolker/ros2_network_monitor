@@ -336,6 +336,18 @@ class MikroTikMonitorNode(Node):
                     ),
                     poll_monotonic=poll_now,
                     poll_wall_iso=poll_wall_iso,
+                    system_health_last_success_monotonic=(
+                        poll_now if system_health is not None
+                        else prev.system_health_last_success_monotonic
+                    ),
+                    interfaces_last_success_monotonic=(
+                        poll_now if interfaces is not None
+                        else prev.interfaces_last_success_monotonic
+                    ),
+                    wireless_last_success_monotonic=(
+                        poll_now if wireless is not None
+                        else prev.wireless_last_success_monotonic
+                    ),
                     wireless_events_last_success_monotonic=(
                         poll_now if wireless_events is not None
                         else prev.wireless_events_last_success_monotonic
@@ -369,6 +381,15 @@ class MikroTikMonitorNode(Node):
                     wireless_events=prev.wireless_events,
                     poll_monotonic=prev.poll_monotonic,
                     poll_wall_iso=poll_wall_iso,
+                    system_health_last_success_monotonic=(
+                        prev.system_health_last_success_monotonic
+                    ),
+                    interfaces_last_success_monotonic=(
+                        prev.interfaces_last_success_monotonic
+                    ),
+                    wireless_last_success_monotonic=(
+                        prev.wireless_last_success_monotonic
+                    ),
                     wireless_events_last_success_monotonic=(
                         prev.wireless_events_last_success_monotonic
                     ),

@@ -88,10 +88,17 @@ class CachedStatus:
     wireless_events: list[dict] = field(default_factory=list)  # from /log filtered to wireless topics
     poll_monotonic: float = 0.0
     poll_wall_iso: str = ''
-    # Per-sub-query success timestamp for the wireless-event log fetch.
-    # Tracked separately from poll_monotonic so the events/<iface> task
-    # surfaces staleness when the outer poll keeps succeeding but the
-    # /log fetch keeps failing.  0.0 means "no successful /log fetch yet".
+    # Per-sub-query success timestamps.  Tracked separately from
+    # poll_monotonic so per-task callbacks can surface staleness when
+    # the outer poll keeps succeeding while a specific sub-query keeps
+    # failing — otherwise tasks would render OK on indefinitely-old
+    # cached data.  0.0 means "no successful fetch for this sub-query
+    # yet".  system_resource has no separate field because its success
+    # is what defines outer-poll success (errors there route through
+    # the outer except).
+    system_health_last_success_monotonic: float = 0.0
+    interfaces_last_success_monotonic: float = 0.0
+    wireless_last_success_monotonic: float = 0.0
     wireless_events_last_success_monotonic: float = 0.0
     error_message: Optional[str] = None  # non-None if last poll attempt failed
 
@@ -167,6 +174,30 @@ def _is_cache_stale(cache: CachedStatus, stale_timeout_sec: float,
     return None
 
 
+def _is_field_stale(
+    last_success_monotonic: float,
+    stale_timeout_sec: float,
+    now_monotonic: float,
+    field_name: str,
+) -> Optional[str]:
+    """Per-sub-query equivalent of ``_is_cache_stale``.
+
+    Lets a task gate its own staleness on the success timestamp of
+    one specific sub-query (e.g. ``interfaces_last_success_monotonic``)
+    rather than the outer ``poll_monotonic``.  ``last_success_monotonic
+    == 0.0`` means "no successful fetch yet" for that sub-query.
+    """
+    if last_success_monotonic == 0.0:
+        return f'no successful {field_name} query yet'
+    age = now_monotonic - last_success_monotonic
+    if age > stale_timeout_sec:
+        return (
+            f'{field_name} {age:.1f}s old '
+            f'(stale_timeout_sec={stale_timeout_sec})'
+        )
+    return None
+
+
 def synthesize_connection_status(
     cache: CachedStatus,
     stale_timeout_sec: float,
@@ -232,7 +263,13 @@ def synthesize_system_status(
         if key in resource:
             kvs.append(KeyValue(key=key, value=str(resource[key])))
 
-    # Optional health data
+    # Optional health data.  system_health is a separate sub-query that
+    # can fail independently of system_resource (especially on devices
+    # that don't support /system/health at all).  Expose its freshness
+    # as a KV alongside the values so operators can see when the health
+    # numbers are stuck on stale data — without escalating the whole
+    # system task to STALE (system_resource is the primary signal and
+    # is gated by poll_monotonic above).
     health = cache.system_health
     if isinstance(health, list):
         for entry in health:
@@ -244,6 +281,19 @@ def synthesize_system_status(
         for key, value in health.items():
             if key != '.id':
                 kvs.append(KeyValue(key=key, value=str(value)))
+    if cache.system_health_last_success_monotonic > 0.0:
+        health_age = now_monotonic - cache.system_health_last_success_monotonic
+        kvs.append(KeyValue(
+            key='system_health_age_sec',
+            value=f'{health_age:.1f}',
+        ))
+    elif health is not None:
+        # Defensive: should not normally happen — health is cached but
+        # the success timestamp wasn't recorded.  Surface as a hint.
+        kvs.append(KeyValue(
+            key='system_health_age_sec',
+            value='unknown (no success ts)',
+        ))
 
     message = resource.get('board-name', 'unknown')
     return DiagnosticStatus.OK, message, kvs
@@ -258,9 +308,22 @@ def synthesize_interface_status(
     """Render the per-interface task."""
     kvs: list[KeyValue] = [_last_query_kv(cache)]
 
-    stale_msg = _is_cache_stale(cache, stale_timeout_sec, now_monotonic)
+    # Gate on the interfaces sub-query's own success timestamp so
+    # repeated /interface failures surface as STALE even when the outer
+    # poll keeps landing.
+    stale_msg = _is_field_stale(
+        cache.interfaces_last_success_monotonic,
+        stale_timeout_sec,
+        now_monotonic,
+        'interfaces',
+    )
     if stale_msg is not None:
         return DiagnosticStatus.STALE, stale_msg, kvs
+    interfaces_age = now_monotonic - cache.interfaces_last_success_monotonic
+    kvs.append(KeyValue(
+        key='interfaces_poll_age_sec',
+        value=f'{interfaces_age:.1f}',
+    ))
 
     iface = _find_by_key(cache.interfaces, 'name', iface_name)
     if iface is None:
@@ -299,9 +362,22 @@ def synthesize_wireless_status(
     """Render the per-wireless-registration task."""
     kvs: list[KeyValue] = [_last_query_kv(cache)]
 
-    stale_msg = _is_cache_stale(cache, stale_timeout_sec, now_monotonic)
+    # Gate on the wireless sub-query's own success timestamp so repeated
+    # /interface/wireless/registration-table failures surface as STALE
+    # even when the outer poll keeps landing.
+    stale_msg = _is_field_stale(
+        cache.wireless_last_success_monotonic,
+        stale_timeout_sec,
+        now_monotonic,
+        'wireless registrations',
+    )
     if stale_msg is not None:
         return DiagnosticStatus.STALE, stale_msg, kvs
+    wireless_age = now_monotonic - cache.wireless_last_success_monotonic
+    kvs.append(KeyValue(
+        key='wireless_poll_age_sec',
+        value=f'{wireless_age:.1f}',
+    ))
 
     reg = _find_wireless(cache.wireless, iface, mac)
     if reg is None:
@@ -504,22 +580,15 @@ def synthesize_wireless_events_status(
     # wireless-event log fetch — not the outer poll_monotonic.  If the
     # outer poll keeps succeeding but /log keeps failing, this task
     # surfaces STALE rather than rendering OK on increasingly old data.
-    if cache.wireless_events_last_success_monotonic == 0.0:
-        return (
-            DiagnosticStatus.STALE,
-            'no successful wireless-event log query yet',
-            kvs,
-        )
+    stale_msg = _is_field_stale(
+        cache.wireless_events_last_success_monotonic,
+        stale_timeout_sec,
+        now_monotonic,
+        'wireless-event log',
+    )
+    if stale_msg is not None:
+        return DiagnosticStatus.STALE, stale_msg, kvs
     events_age = now_monotonic - cache.wireless_events_last_success_monotonic
-    if events_age > stale_timeout_sec:
-        return (
-            DiagnosticStatus.STALE,
-            (
-                f'wireless-event log {events_age:.1f}s old '
-                f'(stale_timeout_sec={stale_timeout_sec})'
-            ),
-            kvs,
-        )
     kvs.append(KeyValue(
         key='events_poll_age_sec',
         value=f'{events_age:.1f}',

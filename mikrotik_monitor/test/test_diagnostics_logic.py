@@ -178,6 +178,9 @@ def test_system_status_handles_dict_health():
         system_resource={'board-name': 'RB4011'},
         system_health={'temperature': 42, '.id': '*1'},
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     _, _, kvs = synthesize_system_status(cache, STALE, NOW)
@@ -192,6 +195,9 @@ def test_interface_running_ok():
     cache = CachedStatus(
         interfaces=[{'name': 'ether1', 'running': 'true', 'tx-byte': 100}],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     level, message, kvs = synthesize_interface_status(
@@ -206,6 +212,9 @@ def test_interface_disabled_warn():
     cache = CachedStatus(
         interfaces=[{'name': 'ether9', 'running': 'false', 'disabled': 'true'}],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     level, message, _ = synthesize_interface_status(
@@ -220,6 +229,9 @@ def test_interface_missing_from_cache_stale():
     cache = CachedStatus(
         interfaces=[{'name': 'ether1', 'running': 'true'}],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     level, message, _ = synthesize_interface_status(
@@ -227,6 +239,36 @@ def test_interface_missing_from_cache_stale():
     )
     assert level == DiagnosticStatus.STALE
     assert 'ether-gone' in message
+
+
+def test_interface_status_stale_when_sub_query_aged_out():
+    """
+    Outer poll keeps succeeding (poll_monotonic fresh) but /interface
+    sub-query last succeeded > stale_timeout_sec ago.  The interface
+    task surfaces STALE on its own sub-query freshness rather than
+    rendering OK on indefinitely-old cached interface data.
+    """
+    cache = CachedStatus(
+        interfaces=[{'name': 'ether1', 'running': 'true', 'tx-byte': 100}],
+        poll_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW - (STALE + 5.0),
+    )
+    level, message, _ = synthesize_interface_status(
+        cache, 'ether1', STALE, NOW,
+    )
+    assert level == DiagnosticStatus.STALE
+    assert 'interfaces' in message
+
+
+def test_interface_status_surfaces_interfaces_poll_age_sec():
+    cache = CachedStatus(
+        interfaces=[{'name': 'ether1', 'running': 'true'}],
+        poll_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW - 3.0,
+    )
+    _, _, kvs = synthesize_interface_status(cache, 'ether1', STALE, NOW)
+    d = _kvs_dict(kvs)
+    assert d['interfaces_poll_age_sec'] == '3.0'
 
 
 # --- Schema-drift regression (the reason this whole refactor exists) ---
@@ -290,6 +332,12 @@ def test_cache_preserved_across_transient_failure():
         wireless=[],
         poll_monotonic=NOW - 1.0,  # previous successful poll, still fresh
         poll_wall_iso='2026-04-23T20:00:00+00:00',
+        # Sub-query timestamps carry forward from the prior successful poll
+        # (the node's poll_callback failure branch preserves these).
+        system_health_last_success_monotonic=NOW - 1.0,
+        interfaces_last_success_monotonic=NOW - 1.0,
+        wireless_last_success_monotonic=NOW - 1.0,
+        wireless_events_last_success_monotonic=NOW - 1.0,
         error_message='Connection error: refused',  # most recent attempt
     )
 
@@ -354,13 +402,14 @@ def test_schema_drift_interfaces_drop_does_not_cascade():
         poll_monotonic=NOW,
         error_message='Connection error: refused',
     )
-    # A registered interface task still exists; its callback sees the
-    # error cache and renders STALE (no interface to look up).
+    # A registered interface task still exists; its callback gates on
+    # the per-sub-query freshness timestamp and emits STALE because
+    # /interface never returned in this cache.
     level, message, _ = synthesize_interface_status(
         err_cache, 'ether1', STALE, NOW,
     )
     assert level == DiagnosticStatus.STALE
-    assert 'ether1' in message
+    assert 'no successful interfaces' in message
 
 
 # --- Dynamic-membership diff ---
@@ -439,6 +488,9 @@ def test_wireless_ok_with_good_snr():
             'tx-rate': '400Mbps',
         }],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     level, message, kvs = synthesize_wireless_status(
@@ -449,6 +501,60 @@ def test_wireless_ok_with_good_snr():
     assert 'Associated' in message
     d = _kvs_dict(kvs)
     assert d['tx-rate'] == '400Mbps'
+
+
+def test_wireless_status_stale_when_sub_query_aged_out():
+    """
+    Outer poll keeps succeeding but /interface/wireless/registration-table
+    sub-query last succeeded > stale_timeout_sec ago.  The per-MAC task
+    surfaces STALE on its sub-query freshness rather than rendering OK
+    on indefinitely-old wireless registration data.
+    """
+    cache = CachedStatus(
+        wireless=[{
+            'interface': 'wlan1', 'mac-address': 'AA:BB:CC:DD:EE:FF',
+            'signal-to-noise': '25@HT40',
+        }],
+        poll_monotonic=NOW,
+        wireless_last_success_monotonic=NOW - (STALE + 5.0),
+    )
+    level, message, _ = synthesize_wireless_status(
+        cache, 'wlan1', 'AA:BB:CC:DD:EE:FF', STALE, NOW,
+    )
+    assert level == DiagnosticStatus.STALE
+    assert 'wireless registrations' in message
+
+
+def test_wireless_status_surfaces_wireless_poll_age_sec():
+    cache = CachedStatus(
+        wireless=[{
+            'interface': 'wlan1', 'mac-address': 'AA:BB:CC:DD:EE:FF',
+            'signal-to-noise': '25@HT40',
+        }],
+        poll_monotonic=NOW,
+        wireless_last_success_monotonic=NOW - 1.5,
+    )
+    _, _, kvs = synthesize_wireless_status(
+        cache, 'wlan1', 'AA:BB:CC:DD:EE:FF', STALE, NOW,
+    )
+    d = _kvs_dict(kvs)
+    assert d['wireless_poll_age_sec'] == '1.5'
+
+
+def test_system_status_surfaces_system_health_age_sec():
+    cache = CachedStatus(
+        system_resource={'board-name': 'RB4011'},
+        system_health=[{'name': 'temperature', 'value': '42'}],
+        poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW - 2.0,
+    )
+    _, _, kvs = synthesize_system_status(cache, STALE, NOW)
+    d = _kvs_dict(kvs)
+    assert d['system_health_age_sec'] == '2.0'
+    # The system task itself stays OK — system_resource is the primary
+    # signal and it's fresh.  Health staleness is observability-only.
+    level, _, _ = synthesize_system_status(cache, STALE, NOW)
+    assert level == DiagnosticStatus.OK
 
 
 # --- Wireless event helpers ---
@@ -557,6 +663,9 @@ def test_events_stale_cache_before_first_poll():
 def test_events_no_events_returns_ok_never():
     cache = CachedStatus(
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     level, message, kvs = synthesize_wireless_events_status(
@@ -580,6 +689,9 @@ def test_events_recent_assoc_no_drops_yields_active_session():
                    'AA:BB:CC@wlan1 established connection on 5745000, SSID bridge'),
         ],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     level, message, kvs = synthesize_wireless_events_status(
@@ -605,6 +717,9 @@ def test_events_drop_after_last_assoc_no_active_session():
                    'AA:BB:CC@wlan1: lost connection, extensive data loss'),
         ],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     level, message, kvs = synthesize_wireless_events_status(
@@ -627,6 +742,9 @@ def test_events_rolling_window_excludes_old_drop():
                    'AA:BB:CC@wlan1: lost connection, extensive data loss'),
         ],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     _, _, kvs = synthesize_wireless_events_status(
@@ -645,6 +763,9 @@ def test_events_rolling_window_excludes_ancient_drop():
                    'AA:BB:CC@wlan1: lost connection, extensive data loss'),
         ],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     _, _, kvs = synthesize_wireless_events_status(
@@ -667,6 +788,9 @@ def test_events_filters_by_interface():
                    'DD:EE:FF@wlan2: lost connection'),
         ],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     _, _, kvs_w1 = synthesize_wireless_events_status(
@@ -728,6 +852,9 @@ def test_events_clock_skew_sec_positive_when_log_older_than_now():
                    'AA:BB:CC@wlan1 established connection on 5745000, SSID bridge'),
         ],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     _, _, kvs = synthesize_wireless_events_status(
@@ -748,6 +875,9 @@ def test_events_negative_ago_clamped_when_router_ahead_of_monitor():
                    'AA:BB:CC@wlan1 established connection on 5745000, SSID bridge'),
         ],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     _, _, kvs = synthesize_wireless_events_status(
@@ -770,6 +900,9 @@ def test_events_level_stays_ok_with_many_drops():
             for i in range(5)  # 5 drops in last 5 min
         ],
         poll_monotonic=NOW,
+        system_health_last_success_monotonic=NOW,
+        interfaces_last_success_monotonic=NOW,
+        wireless_last_success_monotonic=NOW,
         wireless_events_last_success_monotonic=NOW,
     )
     level, _, kvs = synthesize_wireless_events_status(
