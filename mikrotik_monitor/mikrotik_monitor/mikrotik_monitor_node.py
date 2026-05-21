@@ -380,12 +380,18 @@ class MikroTikMonitorNode(Node):
                 self._backoff_max_sec,
             )
             self._next_poll_monotonic = time.monotonic() + backoff
-            # Augment the cached error message with retry timing so the
-            # operator can see we're in a backoff phase, not stuck.
+            # Augment the cached error message with the backoff window
+            # so the operator can see we're in a backoff phase, not
+            # stuck.  The poll body early-returns until
+            # ``_next_poll_monotonic`` so this cached string sticks
+            # around for the full window — phrased as the window itself
+            # (``backoff Xs``) rather than a countdown (``retry in Xs``)
+            # so the value stays accurate without per-timer-fire cache
+            # refreshes.
             error_message = (
                 f'{error_message} '
                 f'(attempt {self._consecutive_failures}, '
-                f'retry in {backoff:.0f}s)'
+                f'backoff {backoff:.0f}s)'
             )
 
         reconcile_args: tuple | None = None
@@ -609,12 +615,15 @@ def main(args=None):
     except SystemExit:
         rclpy.try_shutdown()
         raise
-    except Exception:
+    except Exception as exc:
         # Use the rclpy logger so the failure lands on /rosout as well
         # as stderr.  rclpy.logging.get_logger works even before any
-        # Node exists.
+        # Node exists.  Capture the exception type+message so /rosout
+        # shows *why* the node died, not just that it did — the bare
+        # traceback only reaches stderr.
         rclpy.logging.get_logger('mikrotik_monitor').fatal(
-            'Failed to construct MikroTikMonitorNode'
+            f'Failed to construct MikroTikMonitorNode: '
+            f'{type(exc).__name__}: {exc}'
         )
         rclpy.try_shutdown()
         raise
