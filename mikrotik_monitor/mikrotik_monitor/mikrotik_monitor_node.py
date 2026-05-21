@@ -27,6 +27,8 @@ import time
 import diagnostic_updater
 from mikrotik_monitor.diagnostics_logic import (
     CachedStatus,
+    clamp_backoff_max_sec,
+    compute_poll_backoff,
     diff_dynamic_membership,
     event_interface,
     interface_task_name,
@@ -148,9 +150,18 @@ class MikroTikMonitorNode(Node):
         # never sees silence — closes the silent-startup-crash window
         # reported in the 2026-05-19 deployment.
         self._poll_interval = poll_interval
-        self._backoff_max_sec = self.get_parameter(
-            'backoff_max_sec'
-        ).get_parameter_value().double_value
+        backoff_max_sec, backoff_clamped = clamp_backoff_max_sec(
+            self.get_parameter('backoff_max_sec')
+            .get_parameter_value().double_value,
+            poll_interval,
+        )
+        if backoff_clamped:
+            self.get_logger().warning(
+                f'backoff_max_sec was shorter than poll_interval '
+                f'({poll_interval}s); clamped to {backoff_max_sec}s so the '
+                f'cached (retry in Xs) hint stays accurate.'
+            )
+        self._backoff_max_sec = backoff_max_sec
         self._consecutive_failures = 0
         self._next_poll_monotonic = 0.0  # 0 → poll on next timer fire
 
@@ -363,8 +374,9 @@ class MikroTikMonitorNode(Node):
             self._next_poll_monotonic = 0.0
         else:
             self._consecutive_failures += 1
-            backoff = min(
-                self._poll_interval * (2 ** (self._consecutive_failures - 1)),
+            backoff = compute_poll_backoff(
+                self._poll_interval,
+                self._consecutive_failures,
                 self._backoff_max_sec,
             )
             self._next_poll_monotonic = time.monotonic() + backoff
