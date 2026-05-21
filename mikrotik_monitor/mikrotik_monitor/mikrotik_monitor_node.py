@@ -159,7 +159,7 @@ class MikroTikMonitorNode(Node):
             self.get_logger().warning(
                 f'backoff_max_sec was shorter than poll_interval '
                 f'({poll_interval}s); clamped to {backoff_max_sec}s so the '
-                f'cached (retry in Xs) hint stays accurate.'
+                f'cached (backoff Xs) hint stays accurate.'
             )
         self._backoff_max_sec = backoff_max_sec
         self._consecutive_failures = 0

@@ -68,7 +68,7 @@ def clamp_backoff_max_sec(
 
     Returns ``(clamped_value, was_clamped)`` so the caller can warn the
     operator on misconfig.  If the configured cap is shorter than one
-    poll period, the ``(retry in Xs)`` hint cached on the diagnostic
+    poll period, the ``(backoff Xs)`` hint cached on the diagnostic
     would mislead — the timer still fires at ``poll_interval`` cadence.
     """
     if backoff_max_sec < poll_interval:

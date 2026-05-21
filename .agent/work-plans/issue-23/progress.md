@@ -52,7 +52,14 @@ issue: 23
 **CI**: all-pass
 
 ### Actions
-- [ ] Update the warning string in `mikrotik_monitor_node.py:162` from `cached (retry in Xs) hint` to `cached (backoff Xs) hint` to match the new operator-facing wording.
-- [ ] Update the warning string in `teltonika_monitor_node.py:159` the same way.
-- [ ] Update the `clamp_backoff_max_sec` docstring in `mikrotik_monitor/diagnostics_logic.py:78` from `(retry in Xs) hint` to `(backoff Xs) hint`.
-- [ ] Update the `clamp_backoff_max_sec` docstring in `teltonika_monitor/diagnostics_logic.py:78` the same way.
+- [x] Update the warning string in `mikrotik_monitor_node.py:162` from `cached (retry in Xs) hint` to `cached (backoff Xs) hint` to match the new operator-facing wording.
+- [x] Update the warning string in `teltonika_monitor_node.py:159` the same way.
+- [x] Update the `clamp_backoff_max_sec` docstring in `mikrotik_monitor/diagnostics_logic.py:78` from `(retry in Xs) hint` to `(backoff Xs) hint`.
+- [x] Update the `clamp_backoff_max_sec` docstring in `teltonika_monitor/diagnostics_logic.py:78` the same way.
+
+## Fix
+**Status**: complete
+**When**: 2026-05-21 15:10
+**By**: Claude Code Agent (Claude Opus 4.7 (1M context))
+
+Pure wording sync — propagated the round-2 reword (`retry in Xs` → `backoff Xs`) into the four sites that round 2 missed: two `__init__` warning strings and two `clamp_backoff_max_sec` docstrings. The two remaining `retry in Xs` references in node files are inside the rationale comment that contrasts old vs new wording and are intentional. `colcon test`: 96/96 still passing.
