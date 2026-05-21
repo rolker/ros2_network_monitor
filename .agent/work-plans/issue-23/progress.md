@@ -42,3 +42,17 @@ issue: 23
 **By**: Claude Code Agent (Claude Opus 4.7 (1M context))
 
 **Commit**: `8842b44` — reworded the cached error_message in both nodes from `retry in {backoff}s` to `backoff {backoff}s` (window, not countdown) so the operator's panel reading stays accurate during the gated early-return; captured `as exc` in both `main()` guards and interpolated `{type(exc).__name__}: {exc}` so `/rosout` shows the cause. `colcon test`: 96/96 still passing.
+
+## External Review
+**Status**: complete
+**When**: 2026-05-21 15:05
+**By**: Claude Code Agent (Claude Opus 4.7 (1M context))
+
+**PR**: #24 — 3 reviews (2 stale and addressed, 1 fresh), 4 new valid findings (all wording consistency), 0 false positives
+**CI**: all-pass
+
+### Actions
+- [ ] Update the warning string in `mikrotik_monitor_node.py:162` from `cached (retry in Xs) hint` to `cached (backoff Xs) hint` to match the new operator-facing wording.
+- [ ] Update the warning string in `teltonika_monitor_node.py:159` the same way.
+- [ ] Update the `clamp_backoff_max_sec` docstring in `mikrotik_monitor/diagnostics_logic.py:78` from `(retry in Xs) hint` to `(backoff Xs) hint`.
+- [ ] Update the `clamp_backoff_max_sec` docstring in `teltonika_monitor/diagnostics_logic.py:78` the same way.
