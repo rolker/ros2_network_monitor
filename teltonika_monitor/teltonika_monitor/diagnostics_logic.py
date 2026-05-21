@@ -33,6 +33,49 @@ def interface_task_name(name_prefix: str, iface_name: str) -> str:
     return f'{name_prefix}: interface/{iface_name}'
 
 
+# Largest left-shift we'll ever apply when computing exponential backoff.
+# ``1 << 62`` is ~4.6e18, dwarfing any sensible ``backoff_max_sec``; the
+# outer ``min`` always clamps before we get here.  Bounding the shift
+# guarantees the int→float conversion in ``poll_interval * (1 << shift)``
+# can never raise ``OverflowError`` — the failure mode that would
+# re-introduce the silent timer-callback crash issue #23 closed.
+_MAX_BACKOFF_SHIFT = 62
+
+
+def compute_poll_backoff(
+    poll_interval: float,
+    attempt: int,
+    backoff_max_sec: float,
+) -> float:
+    """Return seconds to wait before the next poll, given consecutive failures.
+
+    Exponential growth (``poll_interval * 2**(attempt-1)``) capped at
+    ``backoff_max_sec``.  Uses a bit-shift with a bounded exponent so the
+    arithmetic cannot overflow no matter how long the outage runs.
+    ``attempt < 1`` returns ``0.0`` (caller's "no backoff" sentinel).
+    """
+    if attempt < 1:
+        return 0.0
+    shift = min(attempt - 1, _MAX_BACKOFF_SHIFT)
+    return min(poll_interval * (1 << shift), backoff_max_sec)
+
+
+def clamp_backoff_max_sec(
+    backoff_max_sec: float,
+    poll_interval: float,
+) -> tuple[float, bool]:
+    """Ensure ``backoff_max_sec >= poll_interval``.
+
+    Returns ``(clamped_value, was_clamped)`` so the caller can warn the
+    operator on misconfig.  If the configured cap is shorter than one
+    poll period, the ``(backoff Xs)`` hint cached on the diagnostic
+    would mislead — the timer still fires at ``poll_interval`` cadence.
+    """
+    if backoff_max_sec < poll_interval:
+        return poll_interval, True
+    return backoff_max_sec, False
+
+
 # System-board fields to surface as KeyValue pairs.
 _SYSTEM_FIELDS = ('model', 'hostname', 'kernel', 'system')
 _SYSTEM_RELEASE_FIELDS = ('distribution', 'version', 'description')

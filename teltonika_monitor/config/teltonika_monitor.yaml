@@ -19,3 +19,8 @@ teltonika_monitor:
     # interface) is removed via Updater.removeByName.  Absorbs
     # transient flaps.  0.0 = auto (2 * stale_timeout_sec).
     dynamic_task_grace_sec: 0.0
+    # Cap on exponential poll backoff when the router is unreachable
+    # (issue #23).  Backoff doubles per consecutive failure starting
+    # from poll_interval and saturates at this value; the next attempt
+    # is logged via the connection DiagnosticStatus.
+    backoff_max_sec: 60.0

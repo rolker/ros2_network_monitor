@@ -30,6 +30,8 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from teltonika_monitor.diagnostics_logic import (
     CachedStatus,
+    clamp_backoff_max_sec,
+    compute_poll_backoff,
     diff_dynamic_membership,
     interface_task_name,
     mwan3_task_name,
@@ -60,6 +62,11 @@ class TeltonikaMonitorNode(Node):
         self.declare_parameter('verify_ssl', False)
         self.declare_parameter('ignored_interfaces', [])
         self.declare_parameter('publish_cellular', True)
+        # Cap on the exponential-backoff interval applied to the poll
+        # timer body when the router is unreachable.  Backoff starts at
+        # poll_interval and doubles per consecutive failure, capped here.
+        # On any success the failure counter resets.  Issue #23.
+        self.declare_parameter('backoff_max_sec', 60.0)
 
         host = self.get_parameter('host').get_parameter_value().string_value
         if not host:
@@ -130,6 +137,31 @@ class TeltonikaMonitorNode(Node):
 
         self._name_prefix = f'Teltonika: {self.hardware_id}'
 
+        # Poll-cadence + backoff state (issue #23).  ``poll_interval`` is
+        # the timer period.  When the router is unreachable we don't
+        # recreate the timer; instead we gate the poll body on
+        # ``_next_poll_monotonic`` and double the gap per consecutive
+        # failure, capped at ``backoff_max_sec``.  The Updater's separate
+        # publish timer keeps emitting DiagnosticStatus.ERROR from the
+        # cached error_message throughout the retry phase so the operator
+        # never sees silence — closes the silent-startup-crash window
+        # reported in the 2026-05-19 deployment.
+        self._poll_interval = poll_interval
+        backoff_max_sec, backoff_clamped = clamp_backoff_max_sec(
+            self.get_parameter('backoff_max_sec')
+            .get_parameter_value().double_value,
+            poll_interval,
+        )
+        if backoff_clamped:
+            self.get_logger().warning(
+                f'backoff_max_sec was shorter than poll_interval '
+                f'({poll_interval}s); clamped to {backoff_max_sec}s so the '
+                f'cached (backoff Xs) hint stays accurate.'
+            )
+        self._backoff_max_sec = backoff_max_sec
+        self._consecutive_failures = 0
+        self._next_poll_monotonic = 0.0  # 0 → poll on next timer fire
+
         self._cache_lock = threading.Lock()
         self._cache = CachedStatus()
         self._mwan3_last_seen: dict[str, float] = {}
@@ -166,7 +198,8 @@ class TeltonikaMonitorNode(Node):
             f'poll every {poll_interval}s, '
             f'publish every {update_period_sec}s, '
             f'stale_timeout={self._stale_timeout_sec}s, '
-            f'dynamic_task_grace={self._dynamic_task_grace_sec}s'
+            f'dynamic_task_grace={self._dynamic_task_grace_sec}s, '
+            f'backoff_max={self._backoff_max_sec}s'
         )
 
     # --- Task callbacks ---
@@ -224,7 +257,24 @@ class TeltonikaMonitorNode(Node):
     # --- Polling ---
 
     def _poll_callback(self):
-        """Fetch the latest router state; update cache and dynamic tasks."""
+        """Fetch the latest router state; update cache and dynamic tasks.
+
+        Wrapped end-to-end so no callback exception can escape into the
+        executor and silently kill the node.  Connection-class failures
+        come through as ``UbusClientError`` and feed the normal
+        cache-preservation path (DiagnosticStatus ERROR via the Updater);
+        any other exception type is caught at the outer ``Exception``
+        guard, logged, and surfaced the same way.  Either form bumps the
+        consecutive-failure counter, which exponentially backs off the
+        next poll attempt up to ``backoff_max_sec``.  See issue #23.
+        """
+        now = time.monotonic()
+        if now < self._next_poll_monotonic:
+            # In backoff after a previous failure; skip this fire.
+            # The Updater's publish timer continues emitting ERROR via
+            # the cached error_message so the operator stays informed.
+            return
+
         poll_wall_iso = datetime.now(timezone.utc).isoformat()
         error_message = None
         system_board = None
@@ -277,6 +327,49 @@ class TeltonikaMonitorNode(Node):
         except UbusClientError as e:
             error_message = f'Connection error: {e}'
             self.get_logger().warning(f'Failed to poll router: {e}')
+        except Exception as e:
+            # Catch-all: an unexpected exception type (e.g., a stdlib
+            # change, an unforeseen payload shape, an SSL surprise) must
+            # not escape the timer callback — that's the silent-startup-
+            # crash path from issue #23.  Surface the error the same way
+            # a connection failure would, so the operator sees ERROR on
+            # /diagnostics instead of nothing.
+            error_message = f'Unexpected error: {type(e).__name__}: {e}'
+            self.get_logger().error(
+                f'Unexpected error polling router: {e}', exc_info=True
+            )
+
+        # Update backoff bookkeeping.  Done before cache mutation so that
+        # the error_message we cache can include the retry-in-Ns hint.
+        if error_message is None:
+            if self._consecutive_failures > 0:
+                self.get_logger().info(
+                    f'Recovered after {self._consecutive_failures} '
+                    f'failed poll attempt(s).'
+                )
+            self._consecutive_failures = 0
+            self._next_poll_monotonic = 0.0
+        else:
+            self._consecutive_failures += 1
+            backoff = compute_poll_backoff(
+                self._poll_interval,
+                self._consecutive_failures,
+                self._backoff_max_sec,
+            )
+            self._next_poll_monotonic = time.monotonic() + backoff
+            # Augment the cached error message with the backoff window
+            # so the operator can see we're in a backoff phase, not
+            # stuck.  The poll body early-returns until
+            # ``_next_poll_monotonic`` so this cached string sticks
+            # around for the full window — phrased as the window itself
+            # (``backoff Xs``) rather than a countdown (``retry in Xs``)
+            # so the value stays accurate without per-timer-fire cache
+            # refreshes.
+            error_message = (
+                f'{error_message} '
+                f'(attempt {self._consecutive_failures}, '
+                f'backoff {backoff:.0f}s)'
+            )
 
         reconcile_args: tuple | None = None
         with self._cache_lock:
@@ -412,7 +505,25 @@ def _emit(stat, level: int, message: str, kvs):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = TeltonikaMonitorNode()
+    # Guard node construction so a parameter-validation or other init
+    # failure is logged on the way out instead of vanishing into a bare
+    # traceback on stdout (issue #23 — silent-startup-crash class).
+    try:
+        node = TeltonikaMonitorNode()
+    except SystemExit:
+        rclpy.try_shutdown()
+        raise
+    except Exception as exc:
+        # rclpy.logging.get_logger works before any Node exists.
+        # Capture the exception type+message so /rosout shows *why* the
+        # node died, not just that it did — the bare traceback only
+        # reaches stderr.
+        rclpy.logging.get_logger('teltonika_monitor').fatal(
+            f'Failed to construct TeltonikaMonitorNode: '
+            f'{type(exc).__name__}: {exc}'
+        )
+        rclpy.try_shutdown()
+        raise
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:

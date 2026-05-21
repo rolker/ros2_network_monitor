@@ -8,3 +8,8 @@ mikrotik_monitor:
     poll_interval: 5.0
     hardware_id: ''
     verify_ssl: false
+    # Cap on exponential poll backoff when the device is unreachable
+    # (issue #23).  Backoff doubles per consecutive failure starting
+    # from poll_interval and saturates at this value; the next attempt
+    # is logged via the connection DiagnosticStatus.
+    backoff_max_sec: 60.0

@@ -12,7 +12,9 @@ from diagnostic_msgs.msg import DiagnosticStatus
 
 from mikrotik_monitor.diagnostics_logic import (
     CachedStatus,
+    clamp_backoff_max_sec,
     classify_event,
+    compute_poll_backoff,
     diff_dynamic_membership,
     event_interface,
     interface_task_name,
@@ -913,3 +915,50 @@ def test_events_level_stays_ok_with_many_drops():
     )
     assert level == DiagnosticStatus.OK   # NEVER escalates on drop count
     assert _kvs_dict(kvs)['drops_last_5min'] == '5'
+
+
+# --- Poll-backoff math ---
+
+def test_compute_poll_backoff_zero_attempt_returns_zero():
+    assert compute_poll_backoff(5.0, 0, 60.0) == 0.0
+    assert compute_poll_backoff(5.0, -1, 60.0) == 0.0
+
+
+def test_compute_poll_backoff_exponential_growth():
+    # attempt=1 → poll_interval; doubles each step until the cap.
+    assert compute_poll_backoff(5.0, 1, 60.0) == 5.0
+    assert compute_poll_backoff(5.0, 2, 60.0) == 10.0
+    assert compute_poll_backoff(5.0, 3, 60.0) == 20.0
+    assert compute_poll_backoff(5.0, 4, 60.0) == 40.0
+
+
+def test_compute_poll_backoff_capped_at_max():
+    # 5 * 2**4 = 80 > 60 → clamped.
+    assert compute_poll_backoff(5.0, 5, 60.0) == 60.0
+    assert compute_poll_backoff(5.0, 100, 60.0) == 60.0
+
+
+def test_compute_poll_backoff_no_overflow_at_huge_attempt():
+    # Inline 2 ** (attempt-1) would OverflowError around attempt=1025
+    # (5.0 * 2**1024 → int-too-large-to-float).  The helper must stay
+    # bounded and just return the cap.
+    assert compute_poll_backoff(5.0, 10_000, 60.0) == 60.0
+    assert compute_poll_backoff(5.0, 1_000_000_000, 60.0) == 60.0
+
+
+def test_clamp_backoff_max_sec_passes_through_valid():
+    value, clamped = clamp_backoff_max_sec(60.0, 5.0)
+    assert value == 60.0
+    assert clamped is False
+
+
+def test_clamp_backoff_max_sec_clamps_when_smaller_than_interval():
+    value, clamped = clamp_backoff_max_sec(2.0, 5.0)
+    assert value == 5.0
+    assert clamped is True
+
+
+def test_clamp_backoff_max_sec_equal_is_not_clamped():
+    value, clamped = clamp_backoff_max_sec(5.0, 5.0)
+    assert value == 5.0
+    assert clamped is False
