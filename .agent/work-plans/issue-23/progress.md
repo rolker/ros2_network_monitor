@@ -33,5 +33,12 @@ issue: 23
 **CI**: all-pass
 
 ### Actions
-- [ ] Reword the cached `(retry in Xs)` hint in both monitors so the displayed countdown stays accurate while the poll body is gated. The current code sets `error_message` once at failure time with `retry in {backoff}s` and then early-returns from `_poll_callback` for the next `backoff` seconds — the publish timer keeps reading that frozen value, so the operator sees a stale countdown. Minimal fix: change phrasing to non-countdown form (`backoff={backoff:.0f}s`) so the cached value is correct regardless of elapsed time. Stretch fix: refresh the cache from inside the early-return branch each timer fire with `retry in {max(0, _next_poll_monotonic - now):.0f}s`.
-- [ ] Capture the exception in both `main()` guards and include `{type(exc).__name__}: {exc}` in the fatal log so `/rosout` shows *why* the node failed to construct, not just *that* it did. Currently `except Exception:` discards the value; the fatal message is the only operator-visible artifact pre-Node-startup.
+- [x] Reword the cached `(retry in Xs)` hint in both monitors so the displayed countdown stays accurate while the poll body is gated. The current code sets `error_message` once at failure time with `retry in {backoff}s` and then early-returns from `_poll_callback` for the next `backoff` seconds — the publish timer keeps reading that frozen value, so the operator sees a stale countdown. Minimal fix: change phrasing to non-countdown form (`backoff={backoff:.0f}s`) so the cached value is correct regardless of elapsed time. Stretch fix: refresh the cache from inside the early-return branch each timer fire with `retry in {max(0, _next_poll_monotonic - now):.0f}s`.
+- [x] Capture the exception in both `main()` guards and include `{type(exc).__name__}: {exc}` in the fatal log so `/rosout` shows *why* the node failed to construct, not just *that* it did. Currently `except Exception:` discards the value; the fatal message is the only operator-visible artifact pre-Node-startup.
+
+## Fix
+**Status**: complete
+**When**: 2026-05-21 14:55
+**By**: Claude Code Agent (Claude Opus 4.7 (1M context))
+
+**Commit**: `8842b44` — reworded the cached error_message in both nodes from `retry in {backoff}s` to `backoff {backoff}s` (window, not countdown) so the operator's panel reading stays accurate during the gated early-return; captured `as exc` in both `main()` guards and interpolated `{type(exc).__name__}: {exc}` so `/rosout` shows the cause. `colcon test`: 96/96 still passing.
