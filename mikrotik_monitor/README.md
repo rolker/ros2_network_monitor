@@ -22,6 +22,17 @@ Zero external Python dependencies — uses only `urllib` (stdlib).
 | `poll_interval` | double | `5.0` | Polling interval in seconds |
 | `hardware_id` | string | `''` | Hardware ID for diagnostics (defaults to host) |
 | `verify_ssl` | bool | `false` | Verify SSL certificate (when use_ssl is true) |
+| `backoff_max_sec` | double | `60.0` | Cap on exponential poll backoff during outages (issue #23) |
+
+### Startup / outage resilience
+
+When the device is unreachable (including at process start) the poll
+callback catches the error, surfaces it via the `: connection`
+`DiagnosticStatus` at `ERROR` level, and schedules the next attempt with
+exponential backoff (starts at `poll_interval`, doubles per consecutive
+failure, capped at `backoff_max_sec`).  On any successful poll the
+counter resets.  The Updater's publish timer continues emitting status
+throughout, so an operator never sees silence when the device is down.
 
 ## Diagnostics Output
 

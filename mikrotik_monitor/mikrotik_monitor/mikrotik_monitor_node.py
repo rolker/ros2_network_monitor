@@ -62,6 +62,11 @@ class MikroTikMonitorNode(Node):
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
         self.declare_parameter('ignored_interfaces', [])
+        # Cap on the exponential-backoff interval applied to the poll
+        # timer body when the device is unreachable.  Backoff starts at
+        # poll_interval and doubles per consecutive failure, capped here.
+        # On any success the failure counter resets.  Issue #23.
+        self.declare_parameter('backoff_max_sec', 60.0)
 
         host = self.get_parameter('host').get_parameter_value().string_value
         if not host:
@@ -133,6 +138,22 @@ class MikroTikMonitorNode(Node):
 
         self._name_prefix = f'MikroTik: {self.hardware_id}'
 
+        # Poll-cadence + backoff state (issue #23).  ``poll_interval`` is
+        # the timer period.  When the device is unreachable we don't
+        # recreate the timer; instead we gate the poll body on
+        # ``_next_poll_monotonic`` and double the gap per consecutive
+        # failure, capped at ``backoff_max_sec``.  The Updater's separate
+        # publish timer keeps emitting DiagnosticStatus.ERROR from the
+        # cached error_message throughout the retry phase so the operator
+        # never sees silence — closes the silent-startup-crash window
+        # reported in the 2026-05-19 deployment.
+        self._poll_interval = poll_interval
+        self._backoff_max_sec = self.get_parameter(
+            'backoff_max_sec'
+        ).get_parameter_value().double_value
+        self._consecutive_failures = 0
+        self._next_poll_monotonic = 0.0  # 0 → poll on next timer fire
+
         # Cache + dynamic-membership bookkeeping.  All access guarded by
         # _cache_lock so task callbacks on the rclpy thread only see
         # consistent snapshots.
@@ -176,7 +197,8 @@ class MikroTikMonitorNode(Node):
             f'poll every {poll_interval}s, '
             f'publish every {update_period_sec}s, '
             f'stale_timeout={self._stale_timeout_sec}s, '
-            f'dynamic_task_grace={self._dynamic_task_grace_sec}s'
+            f'dynamic_task_grace={self._dynamic_task_grace_sec}s, '
+            f'backoff_max={self._backoff_max_sec}s'
         )
 
     # --- Task callbacks ---
@@ -238,7 +260,24 @@ class MikroTikMonitorNode(Node):
     # --- Polling ---
 
     def _poll_callback(self):
-        """Fetch the latest device state; update cache and dynamic tasks."""
+        """Fetch the latest device state; update cache and dynamic tasks.
+
+        Wrapped end-to-end so no callback exception can escape into the
+        executor and silently kill the node.  Connection-class failures
+        come through as ``RouterOSClientError`` and feed the normal
+        cache-preservation path (DiagnosticStatus ERROR via the Updater);
+        any other exception type is caught at the outer ``Exception``
+        guard, logged, and surfaced the same way.  Either form bumps the
+        consecutive-failure counter, which exponentially backs off the
+        next poll attempt up to ``backoff_max_sec``.  See issue #23.
+        """
+        now = time.monotonic()
+        if now < self._next_poll_monotonic:
+            # In backoff after a previous failure; skip this fire.
+            # The Updater's publish timer continues emitting ERROR via
+            # the cached error_message so the operator stays informed.
+            return
+
         poll_wall_iso = datetime.now(timezone.utc).isoformat()
         error_message = None
         system_resource = None
@@ -300,6 +339,42 @@ class MikroTikMonitorNode(Node):
         except RouterOSClientError as e:
             error_message = f'Connection error: {e}'
             self.get_logger().warning(f'Failed to poll device: {e}')
+        except Exception as e:
+            # Catch-all: an unexpected exception type (e.g., a stdlib
+            # change, an unforeseen payload shape, an SSL surprise) must
+            # not escape the timer callback — that's the silent-startup-
+            # crash path from issue #23.  Surface the error the same way
+            # a connection failure would, so the operator sees ERROR on
+            # /diagnostics instead of nothing.
+            error_message = f'Unexpected error: {type(e).__name__}: {e}'
+            self.get_logger().error(
+                f'Unexpected error polling device: {e}', exc_info=True
+            )
+
+        # Update backoff bookkeeping.  Done before cache mutation so that
+        # the error_message we cache can include the retry-in-Ns hint.
+        if error_message is None:
+            if self._consecutive_failures > 0:
+                self.get_logger().info(
+                    f'Recovered after {self._consecutive_failures} '
+                    f'failed poll attempt(s).'
+                )
+            self._consecutive_failures = 0
+            self._next_poll_monotonic = 0.0
+        else:
+            self._consecutive_failures += 1
+            backoff = min(
+                self._poll_interval * (2 ** (self._consecutive_failures - 1)),
+                self._backoff_max_sec,
+            )
+            self._next_poll_monotonic = time.monotonic() + backoff
+            # Augment the cached error message with retry timing so the
+            # operator can see we're in a backoff phase, not stuck.
+            error_message = (
+                f'{error_message} '
+                f'(attempt {self._consecutive_failures}, '
+                f'retry in {backoff:.0f}s)'
+            )
 
         reconcile_args: tuple | None = None
         with self._cache_lock:
@@ -514,7 +589,23 @@ def _emit(stat, level: int, message: str, kvs):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MikroTikMonitorNode()
+    # Guard node construction so a parameter-validation or other init
+    # failure is logged on the way out instead of vanishing into a bare
+    # traceback on stdout (issue #23 — silent-startup-crash class).
+    try:
+        node = MikroTikMonitorNode()
+    except SystemExit:
+        rclpy.try_shutdown()
+        raise
+    except Exception:
+        # Use the rclpy logger so the failure lands on /rosout as well
+        # as stderr.  rclpy.logging.get_logger works even before any
+        # Node exists.
+        rclpy.logging.get_logger('mikrotik_monitor').fatal(
+            'Failed to construct MikroTikMonitorNode'
+        )
+        rclpy.try_shutdown()
+        raise
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
