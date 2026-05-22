@@ -60,7 +60,11 @@ class TeltonikaMonitorNode(Node):
         self.declare_parameter('dynamic_task_grace_sec', 0.0)
         self.declare_parameter('hardware_id', '')
         self.declare_parameter('verify_ssl', False)
-        self.declare_parameter('ignored_interfaces', [])
+        # Declare as type-only (no Python default) — an empty-list
+        # default like ``[]`` is inferred as BYTE_ARRAY by rclpy and
+        # then rejects the STRING_ARRAY YAML override at construction.
+        # Matches the pattern used by ping_monitor in this repo.
+        self.declare_parameter('ignored_interfaces', rclpy.Parameter.Type.STRING_ARRAY)
         self.declare_parameter('publish_cellular', True)
         # Cap on the exponential-backoff interval applied to the poll
         # timer body when the router is unreachable.  Backoff starts at
